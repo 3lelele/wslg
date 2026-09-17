@@ -99,8 +99,27 @@ jobs:
           set -euo pipefail
           cd vendor/weston
           git fetch origin pull/169/head:pr-169
-          git merge --no-edit pr-169 || { git merge --abort 2>/dev/null || true; \
-            echo "::error::合并 weston #169 失败：可能与 #168 存在改动重叠，需人工解决冲突"; exit 1; }
+          if ! git merge --no-edit pr-169; then
+            conflicted=$(git diff --name-only --diff-filter=U)
+            echo "冲突文件: $conflicted"
+            for f in $conflicted; do
+              if [ "$f" = "tests/meson.build" ]; then
+                # #168 与 #169 均在此文件的测试注册区域相邻追加各自条目/宏
+                # （两侧内容互不依赖），union 合并保留两侧全部追加，语法语义均正确
+                git checkout --union -- "$f"
+                if grep -Eq '^(<{7}|={7}|>{7})' "$f"; then
+                  echo "::error::$f union 合并后仍残留冲突标记，需人工处理"
+                  exit 1
+                fi
+                git add -- "$f"
+                echo "已对 $f 应用 union 合并（两侧测试注册条目全部保留）"
+              else
+                echo "::error::$f 的冲突无法自动解决（非追加型冲突），需人工处理"
+                exit 1
+              fi
+            done
+            git commit --no-edit
+          fi
           git log --oneline -4
 
       - name: 构建 system distro VHD（release）
