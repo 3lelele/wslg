@@ -76,8 +76,12 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p vendor
-          git clone --depth 1 -b working https://github.com/microsoft/FreeRDP-mirror     vendor/FreeRDP
-          git clone --depth 1 -b working https://github.com/microsoft/PulseAudio-mirror vendor/pulseaudio
+          # PulseAudio 必须完整克隆：其 meson.build 通过 git-version-gen（依赖 git describe + tags）
+          # 生成版本号，浅克隆无 tags 会导致版本为空、meson 解析越界（Index 1 out of bounds）；
+          # FreeRDP 同样完整克隆，消除版本机制方面的同类隐患
+          git clone -b working https://github.com/microsoft/FreeRDP-mirror     vendor/FreeRDP
+          git clone -b working https://github.com/microsoft/PulseAudio-mirror vendor/pulseaudio
+          # DirectX-Headers 与 Mesa 为静态版本声明，不依赖 git describe，浅克隆已实证可过构建
           git clone --depth 1 -b v1.608.0 https://github.com/microsoft/DirectX-Headers.git vendor/DirectX-Headers-1.0
           git clone --depth 1 -b mesa-23.1.0 https://gitlab.freedesktop.org/mesa/mesa.git  vendor/mesa
           # weston 用 working 分支完整历史（--single-branch 跳过其他分支），保证 PR merge-base 可计算
