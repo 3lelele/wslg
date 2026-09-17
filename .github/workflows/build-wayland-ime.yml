@@ -1,0 +1,165 @@
+# 在 fork 的 microsoft/wslg 仓库中构建带原生 Wayland 输入法的 system distro
+#
+# 集成的三个 PR（均来自上游官方仓库，构建时动态 fetch PR ref，fork 本身保持与上游同步、无分叉）：
+#   - wslg         #1486 : config/weston.ini 启用 [input-method] allow-external
+#   - weston-mirror #168 : text-backend 桥接 text-input-v3 <-> input-method-v1
+#   - weston-mirror #169 : rdprail-shell 支持外部输入法候选窗面板
+#
+# 产物: system_x64.vhd（配合 .wslconfig 的 systemDistro= 使用，随时可回滚官方版）
+#
+# 用法: 将本文件放到 fork 仓库的 .github/workflows/build-wayland-ime.yml，
+#       在 Actions 页面手动 Run workflow。公开仓库 Actions 免费额度不限。
+
+name: Build WSLg system distro with native Wayland IME
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_wslg_1486:
+        description: "wslg PR #1486: allow-external input method 配置"
+        type: boolean
+        default: true
+      apply_weston_168:
+        description: "weston-mirror PR #168: text-input-v3 <-> input-method-v1 桥接"
+        type: boolean
+        default: true
+      apply_weston_169:
+        description: "weston-mirror PR #169: rdprail 外部输入法面板"
+        type: boolean
+        default: true
+      debug_build:
+        description: "调试构建（含 gdb + debug 符号，排查崩溃用）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  WSLG_UPSTREAM: https://github.com/microsoft/wslg
+  WESTON_UPSTREAM: https://github.com/microsoft/weston-mirror
+
+jobs:
+  build:
+    name: Build system_x64.vhd
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 释放磁盘空间（Mesa 编译需要较大空间）
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo docker system prune -af 2>/dev/null || true
+          df -h /
+
+      - name: 检出 wslg fork（完整历史 + tags，供 git describe 生成版本号）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 合并 wslg PR #1486（weston.ini 启用 allow-external）
+        if: ${{ inputs.apply_wslg_1486 }}
+        run: |
+          set -euo pipefail
+          git config user.name "ci-build"
+          git config user.email "ci@localhost"
+          git fetch "$WSLG_UPSTREAM" pull/1486/head:pr-1486
+          git merge --no-edit pr-1486 || { git merge --abort 2>/dev/null || true; \
+            echo "::error::合并 wslg #1486 失败，可能上游已变更 config/weston.ini，请人工检查冲突"; exit 1; }
+          echo "--- config/weston.ini ---"
+          cat config/weston.ini
+
+      - name: 克隆 vendor 源码（weston 用完整历史，保证 PR 合并可计算 merge-base）
+        run: |
+          set -euxo pipefail
+          mkdir -p vendor
+          git clone --depth 1 -b working https://github.com/microsoft/FreeRDP-mirror     vendor/FreeRDP
+          git clone --depth 1 -b working https://github.com/microsoft/PulseAudio-mirror vendor/pulseaudio
+          git clone --depth 1 -b v1.608.0 https://github.com/microsoft/DirectX-Headers.git vendor/DirectX-Headers-1.0
+          git clone --depth 1 -b mesa-23.1.0 https://gitlab.freedesktop.org/mesa/mesa.git  vendor/mesa
+          git clone -b working "$WESTON_UPSTREAM" vendor/weston
+          df -h /
+
+      - name: 合并 weston-mirror PR #168（text-input-v3 <-> input-method-v1）
+        if: ${{ inputs.apply_weston_168 }}
+        run: |
+          set -euo pipefail
+          cd vendor/weston
+          git config user.name "ci-build"
+          git config user.email "ci@localhost"
+          git fetch origin pull/168/head:pr-168
+          git merge --no-edit pr-168 || { git merge --abort 2>/dev/null || true; \
+            echo "::error::合并 weston #168 失败：上游 working 分支可能已前进，需人工 rebase"; exit 1; }
+          git log --oneline -3
+
+      - name: 合并 weston-mirror PR #169（rdprail 外部输入法面板）
+        if: ${{ inputs.apply_weston_169 }}
+        run: |
+          set -euo pipefail
+          cd vendor/weston
+          git fetch origin pull/169/head:pr-169
+          git merge --no-edit pr-169 || { git merge --abort 2>/dev/null || true; \
+            echo "::error::合并 weston #169 失败：可能与 #168 存在改动重叠，需人工解决冲突"; exit 1; }
+          git log --oneline -4
+
+      - name: 构建 system distro VHD（release）
+        if: ${{ inputs.debug_build != true }}
+        run: |
+          set -euo pipefail
+          chmod +x build-and-export.sh
+          ./build-and-export.sh
+
+      - name: 构建 system distro VHD（debug：gdb + debug 符号）
+        if: ${{ inputs.debug_build == true }}
+        run: |
+          set -euo pipefail
+          WSLG_VERSION=$(./devops/get-nuget-version.sh "-Beta" || true)
+          WSLG_VERSION=${WSLG_VERSION:-dev}
+          docker build -f Dockerfile -t system-distro-x64 . \
+            --build-arg WSLG_VERSION="$WSLG_VERSION" \
+            --build-arg WSLG_COMMIT="$(git rev-parse HEAD)" \
+            --build-arg WSLG_ARCH=x86_64 \
+            --build-arg DIRECTX_HEADERS_VERSION="$(git -C vendor/DirectX-Headers-1.0 rev-parse HEAD)" \
+            --build-arg FREERDP_COMMIT="$(git -C vendor/FreeRDP rev-parse HEAD)" \
+            --build-arg MESA_VERSION="$(git -C vendor/mesa rev-parse HEAD)" \
+            --build-arg PULSEAUDIO_COMMIT="$(git -C vendor/pulseaudio rev-parse HEAD)" \
+            --build-arg WESTON_COMMIT="$(git -C vendor/weston rev-parse HEAD)" \
+            --build-arg SYSTEMDISTRO_DEBUG_BUILD=true
+          docker export "$(docker create system-distro-x64)" > system_x64.tar
+          go run github.com/Microsoft/hcsshim/cmd/tar2ext4@v0.13.0 -vhd -i system_x64.tar -o system_x64.vhd
+
+      - name: 记录构建元数据与校验和
+        run: |
+          set -euo pipefail
+          sha256sum system_x64.vhd > system_x64.vhd.sha256
+          {
+            echo "### 构建产物信息"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| wslg 基线 commit | \`$(git rev-parse HEAD)\` |"
+            echo "| weston 合并后 commit | \`$(git -C vendor/weston rev-parse HEAD)\` |"
+            echo "| 集成 PR | wslg#1486 / weston#168 / weston#169（按勾选项） |"
+            echo "| debug 构建 | ${{ inputs.debug_build }} |"
+            echo "| VHD 大小 | $(du -h system_x64.vhd | cut -f1) |"
+            echo "| SHA-256 | \`$(cut -d' ' -f1 system_x64.vhd.sha256)\` |"
+            echo ""
+            echo "部署方法：将 system_x64.vhd 下载到本机后，在 \`%USERPROFILE%\\.wslconfig\` 的 \`[wsl2]\` 段加入："
+            echo ""
+            echo "\`\`\`"
+            echo "systemDistro=<VHD绝对路径>"
+            echo "\`\`\`"
+            echo "然后以管理员执行 \`wsl --shutdown\` 后启动任意发行版即生效；删除该行并重启即可回滚官方版。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 VHD 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: system_x64-vhd-wayland-ime
+          path: |
+            system_x64.vhd
+            system_x64.vhd.sha256
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 90
