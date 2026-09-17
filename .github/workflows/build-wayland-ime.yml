@@ -90,7 +90,9 @@ jobs:
           # #168/#169 均在该文件的测试注册区域相邻追加条目，3-way 无法自动合并；
           # 实证内置 union driver 会碎片化交错两侧插入、损坏 meson 语法（weston 构建期报错），
           # 故该文件改用自定义 ours 策略（冲突时保持本分支版本），随后由“预构造”步骤
-          # 以行级重放方式生成两侧条目并置的确定性结果并整体覆盖
+          # 以行级重放方式生成三侧条目并置的确定性结果并整体覆盖。
+          # 重放基准为两个 PR 的共同 fork 点（而非 working HEAD），
+          # 因此上游 working 分支对 tests/meson.build 的后续改动也会被纳入重放，不会误报。
           git -C vendor/weston config user.name "ci-build"
           git -C vendor/weston config user.email "ci@localhost"
           git -C vendor/weston config merge.ours.driver true
@@ -129,30 +131,35 @@ jobs:
                   ['git', 'merge-base', a, b], text=True).strip()
 
           W = show(BASE)
-          B168 = show(merge_base(BASE, P168))
-          B169 = show(merge_base(BASE, P169))
-          # 两个 PR fork 后 working 对该文件不得有变化，否则重放基准不确定，转人工
-          if B168 != W or B169 != W:
-              sys.exit('ERROR: working 分支的 tests/meson.build 与 PR fork 点不一致（上游已前进），需人工处理')
+          F168 = merge_base(BASE, P168)
+          F169 = merge_base(BASE, P169)
+          # 两个 PR 必须 fork 自同一提交，否则三路重放基准不确定，转人工
+          if F168 != F169:
+              sys.exit('ERROR: #168/#169 的 fork 点不一致，需人工处理')
+          F = show(F168)
 
-          def ops(side):
-              S = show(side)
-              sm = difflib.SequenceMatcher(None, W, S, autojunk=False)
-              return [(i1, i2, S[j1:j2])
+          def ops(a, b):
+              sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+              return [(i1, i2, b[j1:j2])
                       for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != 'equal']
 
-          ops168, ops169 = ops(P168), ops(P169)
-          # 两套行级操作按行号并置重放；同锚点时 #168 在前 #169 在后
-          tagged = [(0, *o) for o in ops168] + [(1, *o) for o in ops169]
+          # 以 fork 点为基准，把 working 分支的后续改动也纳入重放（上游前进不再报错），
+          # 三路行级操作按行号并置；同锚点时 working 在前、#168 居中、#169 在后
+          ops_work = ops(F, W)
+          ops168 = ops(F, show(P168))
+          ops169 = ops(F, show(P169))
+          tagged = ([(0, *o) for o in ops_work] +
+                    [(1, *o) for o in ops168] +
+                    [(2, *o) for o in ops169])
           tagged.sort(key=lambda o: (o[1], o[2], o[0]))
           out, pos = [], 0
           for src, i1, i2, lines in tagged:
               if i1 < pos:
-                  sys.exit('ERROR: #168/#169 对 tests/meson.build 的改动区间交叉，需人工处理')
-              out.extend(W[pos:i1])
+                  sys.exit('ERROR: working/#168/#169 对 tests/meson.build 的改动区间交叉，需人工处理')
+              out.extend(F[pos:i1])
               out.extend(lines)
               pos = i2
-          out.extend(W[pos:])
+          out.extend(F[pos:])
           result = ''.join(out)
 
           need = ['TESTSUITE_TEXT_CONFIG_PATH', 'exe_text_input_method_test',
@@ -164,7 +171,7 @@ jobs:
               sys.exit(f'ERROR: 预构造结果缺少关键条目: {missing}')
 
           open('/tmp/tests-meson-final.build', 'w').write(result)
-          print(f'预构造完成: {len(ops168)} 处 #168 改动 + {len(ops169)} 处 #169 改动已按行号并置')
+          print(f'预构造完成: {len(ops_work)} 处 working 改动 + {len(ops168)} 处 #168 改动 + {len(ops169)} 处 #169 改动已按行号并置')
           PY
 
       - name: 合并 weston-mirror PR #169（rdprail 外部输入法面板）
