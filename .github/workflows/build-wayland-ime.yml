@@ -170,6 +170,20 @@ jobs:
           if missing:
               sys.exit(f'ERROR: 预构造结果缺少关键条目: {missing}')
 
+          # 跨 PR 依赖修复：working 分支新增的 rdp-teardown 测试条目中，
+          # plugin_rdp.extract_objects(...) 列表缺 rdprail-window-state.c
+          # （#169 新增文件，定义 rdp_rail_prepare/send_window_state_order，
+          #  合并后 rdprail.c 会调用这两个函数）。
+          # 若缺该文件，链接 test-rdp-teardown 时 undefined reference。
+          # 仅在 rdprail.c 存在且 rdprail-window-state.c 缺失时补入（幂等）。
+          if "'rdprail.c'," in result and "'rdprail-window-state.c'," not in result:
+              result = result.replace(
+                  "'rdprail.c',",
+                  "'rdprail.c',\n\t\t\t'rdprail-window-state.c',",
+                  1,
+              )
+              print('补丁: rdp-teardown extract_objects 已补入 rdprail-window-state.c')
+
           open('/tmp/tests-meson-final.build', 'w').write(result)
           print(f'预构造完成: {len(ops_work)} 处 working 改动 + {len(ops168)} 处 #168 改动 + {len(ops169)} 处 #169 改动已按行号并置')
           PY
@@ -195,6 +209,26 @@ jobs:
             git add tests/meson.build
             git commit --no-edit -m "Merge fix: deterministic union of tests/meson.build (weston #168 + #169)"
           fi
+          # 跨 PR 依赖修复（幂等，双勾时预构造结果已含，不会重复插入）：
+          # working 分支的 rdp-teardown 测试条目中 plugin_rdp.extract_objects(...)
+          # 缺 rdprail-window-state.c（#169 新增文件，定义 rdp_rail_prepare/send_window_state_order，
+          # 合并后 rdprail.c 会调用这两个函数），缺该文件时链接 test-rdp-teardown 会 undefined reference。
+          # 单勾 #169 时预构造步骤不运行，tests/meson.build 保持 working 版本，同样需要此补丁。
+          python3 - <<'PY'
+          s = open('tests/meson.build').read()
+          if "'rdprail.c'," in s and "'rdprail-window-state.c'," not in s:
+              s = s.replace(
+                  "'rdprail.c',",
+                  "'rdprail.c',\n\t\t\t'rdprail-window-state.c',",
+                  1,
+              )
+              open('tests/meson.build', 'w').write(s)
+              print('补丁: rdp-teardown extract_objects 已补入 rdprail-window-state.c')
+          else:
+              print('补丁: rdprail-window-state.c 已存在，跳过')
+          PY
+          git add tests/meson.build
+          git commit --no-edit -m "Fix: add rdprail-window-state.c to rdp-teardown extract_objects" 2>/dev/null || true
           # 校验 1：不允许残留冲突标记
           if grep -En '^(<{7} |={7}$|>{7} )' tests/meson.build; then
             echo "::error::tests/meson.build 仍含冲突标记，需人工处理"
