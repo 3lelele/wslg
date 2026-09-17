@@ -86,13 +86,16 @@ jobs:
           git clone --depth 1 -b mesa-23.1.0 https://gitlab.freedesktop.org/mesa/mesa.git  vendor/mesa
           # weston 用 working 分支完整历史（--single-branch 跳过其他分支），保证 PR merge-base 可计算
           git clone --single-branch -b working "$WESTON_UPSTREAM" vendor/weston
-          # 提前为 weston 仓库配置提交身份与 tests/meson.build 的 union 合并策略：
-          # #168/#169 均在该文件的测试注册区域相邻追加条目（两侧互不依赖），
-          # 内置 union driver 保留两侧全部内容且不产生冲突标记（适用于任意 PR 勾选组合）
+          # 提前为 weston 仓库配置提交身份与 tests/meson.build 的合并策略。
+          # #168/#169 均在该文件的测试注册区域相邻追加条目，3-way 无法自动合并；
+          # 实证内置 union driver 会碎片化交错两侧插入、损坏 meson 语法（weston 构建期报错），
+          # 故该文件改用自定义 ours 策略（冲突时保持本分支版本），随后由“预构造”步骤
+          # 以行级重放方式生成两侧条目并置的确定性结果并整体覆盖
           git -C vendor/weston config user.name "ci-build"
           git -C vendor/weston config user.email "ci@localhost"
+          git -C vendor/weston config merge.ours.driver true
           mkdir -p vendor/weston/.git/info
-          echo "tests/meson.build merge=union" >> vendor/weston/.git/info/attributes
+          echo "tests/meson.build merge=ours" >> vendor/weston/.git/info/attributes
           df -h /
 
       - name: 合并 weston-mirror PR #168（text-input-v3 <-> input-method-v1）
@@ -105,41 +108,110 @@ jobs:
             echo "::error::合并 weston #168 失败：上游 working 分支可能已前进，需人工 rebase"; exit 1; }
           git log --oneline -3
 
+      - name: 预构造 tests/meson.build 的确定性合并结果（#168+#169 双勾时）
+        if: ${{ inputs.apply_weston_168 && inputs.apply_weston_169 }}
+        run: |
+          set -euo pipefail
+          cd vendor/weston
+          git fetch origin +pull/169/head:pr-169
+          python3 - <<'PY'
+          import subprocess, sys, difflib
+
+          FILE = 'tests/meson.build'
+          BASE, P168, P169 = 'origin/working', 'pr-168', 'pr-169'
+
+          def show(ref):
+              return subprocess.check_output(
+                  ['git', 'show', f'{ref}:{FILE}'], text=True).splitlines(keepends=True)
+
+          def merge_base(a, b):
+              return subprocess.check_output(
+                  ['git', 'merge-base', a, b], text=True).strip()
+
+          W = show(BASE)
+          B168 = show(merge_base(BASE, P168))
+          B169 = show(merge_base(BASE, P169))
+          # 两个 PR fork 后 working 对该文件不得有变化，否则重放基准不确定，转人工
+          if B168 != W or B169 != W:
+              sys.exit('ERROR: working 分支的 tests/meson.build 与 PR fork 点不一致（上游已前进），需人工处理')
+
+          def ops(side):
+              S = show(side)
+              sm = difflib.SequenceMatcher(None, W, S, autojunk=False)
+              return [(i1, i2, S[j1:j2])
+                      for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != 'equal']
+
+          ops168, ops169 = ops(P168), ops(P169)
+          # 两套行级操作按行号并置重放；同锚点时 #168 在前 #169 在后
+          tagged = [(0, *o) for o in ops168] + [(1, *o) for o in ops169]
+          tagged.sort(key=lambda o: (o[1], o[2], o[0]))
+          out, pos = [], 0
+          for src, i1, i2, lines in tagged:
+              if i1 < pos:
+                  sys.exit('ERROR: #168/#169 对 tests/meson.build 的改动区间交叉，需人工处理')
+              out.extend(W[pos:i1])
+              out.extend(lines)
+              pos = i2
+          out.extend(W[pos:])
+          result = ''.join(out)
+
+          need = ['TESTSUITE_TEXT_CONFIG_PATH', 'exe_text_input_method_test',
+                  'TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH',
+                  "'name': 'input-method-bind'",
+                  'TESTSUITE_RDPRAIL_INPUT_PANEL_CONFIG_PATH']
+          missing = [n for n in need if n not in result]
+          if missing:
+              sys.exit(f'ERROR: 预构造结果缺少关键条目: {missing}')
+
+          open('/tmp/tests-meson-final.build', 'w').write(result)
+          print(f'预构造完成: {len(ops168)} 处 #168 改动 + {len(ops169)} 处 #169 改动已按行号并置')
+          PY
+
       - name: 合并 weston-mirror PR #169（rdprail 外部输入法面板）
         if: ${{ inputs.apply_weston_169 }}
         run: |
           set -euo pipefail
           cd vendor/weston
-          git fetch origin pull/169/head:pr-169
+          git fetch origin +pull/169/head:pr-169
           if ! git merge --no-edit pr-169; then
             conflicted=$(git diff --name-only --diff-filter=U)
             echo "冲突文件: $conflicted"
             for f in $conflicted; do
-              echo "::error::$f 的冲突无法自动解决（union 策略仅覆盖 tests/meson.build 的追加型冲突），需人工处理"
+              echo "::error::$f 的冲突无法自动解决（tests/meson.build 已由 ours 策略接管），需人工处理"
             done
             exit 1
           fi
-          # union driver 解决全部冲突后 merge 应已自动提交；此处防御性兜底
-          if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-            git commit --no-edit
+          # 双 PR 勾选时：以预构造的确定性结果覆盖 tests/meson.build
+          # （ours 策略在 merge 时丢弃了 #169 对该文件的改动，此处按行级重放补回，两侧条目并置且语法完整）
+          if [ "${{ inputs.apply_weston_168 }}" = "true" ] && [ -f /tmp/tests-meson-final.build ]; then
+            cp /tmp/tests-meson-final.build tests/meson.build
+            git add tests/meson.build
+            git commit --no-edit -m "Merge fix: deterministic union of tests/meson.build (weston #168 + #169)"
           fi
-          # 校验 1：不允许残留冲突标记（union 不产生标记，此为防御）
+          # 校验 1：不允许残留冲突标记
           if grep -En '^(<{7} |={7}$|>{7} )' tests/meson.build; then
             echo "::error::tests/meson.build 仍含冲突标记，需人工处理"
             exit 1
           fi
-          # 校验 2：union 合并语义正确性 —— 关键测试注册条目必须存在
+          # 校验 2：关键测试注册条目必须存在
           check() { grep -q "$1" tests/meson.build || \
-            { echo "::error::校验失败：tests/meson.build 中缺少 $1（union 合并结果异常），需人工检查"; exit 1; }; }
+            { echo "::error::校验失败：tests/meson.build 中缺少 $1，需人工检查"; exit 1; }; }
           check "TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH"
           check "'name': 'input-method-bind'"
           check "TESTSUITE_RDPRAIL_INPUT_PANEL_CONFIG_PATH"
-          # 若 #168 也已合并，校验其关键条目同时存在
           if [ "${{ inputs.apply_weston_168 }}" = "true" ]; then
             check "TESTSUITE_TEXT_CONFIG_PATH"
             check "exe_text_input_method_test"
           fi
-          echo "tests/meson.build 合并校验通过：两侧测试注册条目均存在"
+          # 校验 3：括号平衡（拦截交错/损坏导致的语法问题）
+          python3 - <<'PY'
+          s = open('tests/meson.build').read()
+          for a, b in (('(', ')'), ('[', ']')):
+              if s.count(a) != s.count(b):
+                  raise SystemExit(f'ERROR: {a}{b} 括号不平衡，构造结果语法损坏，需人工检查')
+          print('括号平衡校验通过')
+          PY
+          echo "tests/meson.build 校验全部通过"
           git log --oneline -4
 
       - name: 构建 system distro VHD（release）
