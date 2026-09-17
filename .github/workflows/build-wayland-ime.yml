@@ -34,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  actions: write   # upload-artifact@v4 走 Artifacts API 上传产物必需
 
 env:
   WSLG_UPSTREAM: https://github.com/microsoft/wslg
@@ -43,12 +44,13 @@ jobs:
   build:
     name: Build system_x64.vhd
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: 释放磁盘空间（Mesa 编译需要较大空间）
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/share/swift /usr/local/julia* 2>/dev/null || true
           sudo docker system prune -af 2>/dev/null || true
           df -h /
 
@@ -70,7 +72,7 @@ jobs:
           echo "--- config/weston.ini ---"
           cat config/weston.ini
 
-      - name: 克隆 vendor 源码（weston 用完整历史，保证 PR 合并可计算 merge-base）
+      - name: 克隆 vendor 源码并配置 weston 合并策略
         run: |
           set -euxo pipefail
           mkdir -p vendor
@@ -78,7 +80,15 @@ jobs:
           git clone --depth 1 -b working https://github.com/microsoft/PulseAudio-mirror vendor/pulseaudio
           git clone --depth 1 -b v1.608.0 https://github.com/microsoft/DirectX-Headers.git vendor/DirectX-Headers-1.0
           git clone --depth 1 -b mesa-23.1.0 https://gitlab.freedesktop.org/mesa/mesa.git  vendor/mesa
-          git clone -b working "$WESTON_UPSTREAM" vendor/weston
+          # weston 用 working 分支完整历史（--single-branch 跳过其他分支），保证 PR merge-base 可计算
+          git clone --single-branch -b working "$WESTON_UPSTREAM" vendor/weston
+          # 提前为 weston 仓库配置提交身份与 tests/meson.build 的 union 合并策略：
+          # #168/#169 均在该文件的测试注册区域相邻追加条目（两侧互不依赖），
+          # 内置 union driver 保留两侧全部内容且不产生冲突标记（适用于任意 PR 勾选组合）
+          git -C vendor/weston config user.name "ci-build"
+          git -C vendor/weston config user.email "ci@localhost"
+          mkdir -p vendor/weston/.git/info
+          echo "tests/meson.build merge=union" >> vendor/weston/.git/info/attributes
           df -h /
 
       - name: 合并 weston-mirror PR #168（text-input-v3 <-> input-method-v1）
@@ -86,8 +96,6 @@ jobs:
         run: |
           set -euo pipefail
           cd vendor/weston
-          git config user.name "ci-build"
-          git config user.email "ci@localhost"
           git fetch origin pull/168/head:pr-168
           git merge --no-edit pr-168 || { git merge --abort 2>/dev/null || true; \
             echo "::error::合并 weston #168 失败：上游 working 分支可能已前进，需人工 rebase"; exit 1; }
@@ -103,23 +111,31 @@ jobs:
             conflicted=$(git diff --name-only --diff-filter=U)
             echo "冲突文件: $conflicted"
             for f in $conflicted; do
-              if [ "$f" = "tests/meson.build" ]; then
-                # #168 与 #169 均在此文件的测试注册区域相邻追加各自条目/宏
-                # （两侧内容互不依赖），union 合并保留两侧全部追加，语法语义均正确
-                git checkout --union -- "$f"
-                if grep -Eq '^(<{7}|={7}|>{7})' "$f"; then
-                  echo "::error::$f union 合并后仍残留冲突标记，需人工处理"
-                  exit 1
-                fi
-                git add -- "$f"
-                echo "已对 $f 应用 union 合并（两侧测试注册条目全部保留）"
-              else
-                echo "::error::$f 的冲突无法自动解决（非追加型冲突），需人工处理"
-                exit 1
-              fi
+              echo "::error::$f 的冲突无法自动解决（union 策略仅覆盖 tests/meson.build 的追加型冲突），需人工处理"
             done
+            exit 1
+          fi
+          # union driver 解决全部冲突后 merge 应已自动提交；此处防御性兜底
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
             git commit --no-edit
           fi
+          # 校验 1：不允许残留冲突标记（union 不产生标记，此为防御）
+          if grep -En '^(<{7} |={7}$|>{7} )' tests/meson.build; then
+            echo "::error::tests/meson.build 仍含冲突标记，需人工处理"
+            exit 1
+          fi
+          # 校验 2：union 合并语义正确性 —— 关键测试注册条目必须存在
+          check() { grep -q "$1" tests/meson.build || \
+            { echo "::error::校验失败：tests/meson.build 中缺少 $1（union 合并结果异常），需人工检查"; exit 1; }; }
+          check "TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH"
+          check "'name': 'input-method-bind'"
+          check "TESTSUITE_RDPRAIL_INPUT_PANEL_CONFIG_PATH"
+          # 若 #168 也已合并，校验其关键条目同时存在
+          if [ "${{ inputs.apply_weston_168 }}" = "true" ]; then
+            check "TESTSUITE_TEXT_CONFIG_PATH"
+            check "exe_text_input_method_test"
+          fi
+          echo "tests/meson.build 合并校验通过：两侧测试注册条目均存在"
           git log --oneline -4
 
       - name: 构建 system distro VHD（release）
