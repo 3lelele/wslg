@@ -344,92 +344,99 @@ jobs:
           set -euo pipefail
           cd vendor/weston
           git fetch origin +pull/172/head:pr-172
+          # 先尝试合并；#172 与 #169 在 backend-rdp.h 和 rdprail.c 有已知冲突，
+          # 冲突区域逻辑互补，用下面的确定性补丁解决。
+          # 注意：heredoc 不能放在 if 分支内（YAML 剥离缩进后结束标记带缩进，
+          # bash 无法闭合 heredoc），故冲突解决脚本放在 if 分支外无条件运行，
+          # 脚本内部判断是否有冲突标记，无冲突则自动跳过。
           if ! git merge --no-edit pr-172; then
             conflicted=$(git diff --name-only --diff-filter=U)
             echo "冲突文件: $conflicted"
-            # #172 与 #169 在 backend-rdp.h 和 rdprail.c 有已知冲突，
-            # 冲突区域逻辑互补，用确定性补丁解决（见下）。
-            python3 - <<'PY'
-            import sys
+          fi
+          # 冲突解决（幂等：无冲突标记则跳过）
+          python3 - <<'PY'
+          import sys
 
-            # 冲突标记用 chr() 拼接，避免字面量被 YAML 解析为 merge key
-            M7 = chr(60) * 7   # 7x '<'
-            E7 = chr(61) * 7   # 7x '='
-            G7 = chr(62) * 7   # 7x '>'
+          # 冲突标记用 chr() 拼接，避免字面量被 YAML 解析为 merge key
+          M7 = chr(60) * 7   # 7x '<'
+          E7 = chr(61) * 7   # 7x '='
+          G7 = chr(62) * 7   # 7x '>'
 
-            def resolve(path, old, new, desc):
-                with open(path, encoding='utf-8') as f:
-                    s = f.read()
-                if old in s:
-                    s = s.replace(old, new, 1)
-                    with open(path, 'w', encoding='utf-8', newline='') as f:
-                        f.write(s)
-                    print(f'解决: {desc}')
-                elif M7 not in s:
-                    print(f'跳过: {desc}（无冲突标记）')
-                else:
-                    print(f'ERROR: {desc} 冲突块不匹配，需人工处理')
-                    sys.exit(1)
+          def resolve(path, old, new, desc):
+              with open(path, encoding='utf-8') as f:
+                  s = f.read()
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  with open(path, 'w', encoding='utf-8', newline='') as f:
+                      f.write(s)
+                  print(f'解决: {desc}')
+              elif M7 not in s:
+                  print(f'跳过: {desc}（无冲突标记）')
+              else:
+                  print(f'ERROR: {desc} 冲突块不匹配，需人工处理')
+                  sys.exit(1)
 
-            # 冲突 1：backend-rdp.h —— #169 加 set_window_owner/set_window_visible，
-            # #172 加 notify_popup_state，保留两侧全部回调
-            resolve(
-                'include/libweston/backend-rdp.h',
-                M7 + ' HEAD\n'
-                '\n'
-                '\t/** Set the RAIL owner of a surface.\n'
-                '\t */\n'
-                '\tvoid (*set_window_owner)(struct weston_surface *surface,\n'
-                '\t\t\t\t struct weston_surface *owner);\n'
-                '\n'
-                '\t/** Update the RAIL visibility of a surface.\n'
-                '\t */\n'
-                '\tvoid (*set_window_visible)(struct weston_surface *surface,\n'
-                '\t\t\t\t   bool visible);\n'
-                + E7 + '\n'
-                '\tvoid (*notify_popup_state)(struct weston_surface *surface, bool mapped);\n'
-                + G7 + ' pr-172',
-                '\t/** Set the RAIL owner of a surface.\n'
-                '\t */\n'
-                '\tvoid (*set_window_owner)(struct weston_surface *surface,\n'
-                '\t\t\t\t struct weston_surface *owner);\n'
-                '\n'
-                '\t/** Update the RAIL visibility of a surface.\n'
-                '\t */\n'
-                '\tvoid (*set_window_visible)(struct weston_surface *surface,\n'
-                '\t\t\t\t   bool visible);\n'
-                '\n'
-                '\t/** Notify popup state change.\n'
-                '\t */\n'
-                '\tvoid (*notify_popup_state)(struct weston_surface *surface, bool mapped);',
-                'backend-rdp.h 回调合并',
-            )
+          # 冲突 1：backend-rdp.h —— #169 加 set_window_owner/set_window_visible，
+          # #172 加 notify_popup_state，保留两侧全部回调
+          resolve(
+              'include/libweston/backend-rdp.h',
+              M7 + ' HEAD\n'
+              '\n'
+              '\t/** Set the RAIL owner of a surface.\n'
+              '\t */\n'
+              '\tvoid (*set_window_owner)(struct weston_surface *surface,\n'
+              '\t\t\t\t struct weston_surface *owner);\n'
+              '\n'
+              '\t/** Update the RAIL visibility of a surface.\n'
+              '\t */\n'
+              '\tvoid (*set_window_visible)(struct weston_surface *surface,\n'
+              '\t\t\t\t   bool visible);\n'
+              + E7 + '\n'
+              '\tvoid (*notify_popup_state)(struct weston_surface *surface, bool mapped);\n'
+              + G7 + ' pr-172',
+              '\t/** Set the RAIL owner of a surface.\n'
+              '\t */\n'
+              '\tvoid (*set_window_owner)(struct weston_surface *surface,\n'
+              '\t\t\t\t struct weston_surface *owner);\n'
+              '\n'
+              '\t/** Update the RAIL visibility of a surface.\n'
+              '\t */\n'
+              '\tvoid (*set_window_visible)(struct weston_surface *surface,\n'
+              '\t\t\t\t   bool visible);\n'
+              '\n'
+              '\t/** Notify popup state change.\n'
+              '\t */\n'
+              '\tvoid (*notify_popup_state)(struct weston_surface *surface, bool mapped);',
+              'backend-rdp.h 回调合并',
+          )
 
-            # 冲突 2：rdprail.c —— #169 用 state_fields 位掩码判断 showState 变化，
-            # #172 在 showState 变化时插入 z-order 通知/刷新。
-            # 保留 #169 的条件（更精确），合并 #172 的 z-order 逻辑。
-            resolve(
-                'libweston/backend-rdp/rdprail.c',
-                M7 + ' HEAD\n'
-                '\t\tif (state_fields & WINDOW_ORDER_FIELD_SHOW) {\n'
-                + E7 + '\n'
-                '\t\tif (rail_state->showState != rail_state->showState_requested) {\n'
-                '\t\t\trdp_rail_notify_window_zorder_change(compositor);\n'
-                '\t\t\tif (!rdp_rail_flush_window_zorder(b))\n'
-                '\t\t\t\treturn 0;\n'
-                + G7 + ' pr-172',
-                '\t\tif (state_fields & WINDOW_ORDER_FIELD_SHOW) {\n'
-                '\t\t\trdp_rail_notify_window_zorder_change(compositor);\n'
-                '\t\t\tif (!rdp_rail_flush_window_zorder(b))\n'
-                '\t\t\t\treturn 0;',
-                'rdprail.c showState 冲突合并',
-            )
-            PY
-            # 校验：不允许残留冲突标记
-            if grep -En '^(<{7} |={7}$|>{7} )' include/libweston/backend-rdp.h libweston/backend-rdp/rdprail.c; then
-              echo "::error::冲突解决后仍含冲突标记，需人工处理"
-              exit 1
-            fi
+          # 冲突 2：rdprail.c —— #169 用 state_fields 位掩码判断 showState 变化，
+          # #172 在 showState 变化时插入 z-order 通知/刷新。
+          # 保留 #169 的条件（更精确），合并 #172 的 z-order 逻辑。
+          resolve(
+              'libweston/backend-rdp/rdprail.c',
+              M7 + ' HEAD\n'
+              '\t\tif (state_fields & WINDOW_ORDER_FIELD_SHOW) {\n'
+              + E7 + '\n'
+              '\t\tif (rail_state->showState != rail_state->showState_requested) {\n'
+              '\t\t\trdp_rail_notify_window_zorder_change(compositor);\n'
+              '\t\t\tif (!rdp_rail_flush_window_zorder(b))\n'
+              '\t\t\t\treturn 0;\n'
+              + G7 + ' pr-172',
+              '\t\tif (state_fields & WINDOW_ORDER_FIELD_SHOW) {\n'
+              '\t\t\trdp_rail_notify_window_zorder_change(compositor);\n'
+              '\t\t\tif (!rdp_rail_flush_window_zorder(b))\n'
+              '\t\t\t\treturn 0;',
+              'rdprail.c showState 冲突合并',
+          )
+          PY
+          # 校验：不允许残留冲突标记
+          if grep -En '^(<{7} |={7}$|>{7} )' include/libweston/backend-rdp.h libweston/backend-rdp/rdprail.c; then
+            echo "::error::冲突解决后仍含冲突标记，需人工处理"
+            exit 1
+          fi
+          # 若合并处于冲突状态，则完成合并提交；否则（无冲突）跳过
+          if git diff --name-only --diff-filter=U | grep -q .; then
             git add include/libweston/backend-rdp.h libweston/backend-rdp/rdprail.c
             git commit --no-edit -m "Merge pr-172 with conflict resolution (backend-rdp.h + rdprail.c)"
           fi
