@@ -314,28 +314,50 @@ jobs:
             done
             exit 1
           fi
-          # 已知问题：git ort 合并算法会静默丢弃 #166 对 tests/meson.build 的
+          # 已知问题 1：git ort 合并算法会静默丢弃 #166 对 tests/meson.build 的
           # rdpclip-fd 测试条目（tests_standalone 数组中间插入 vs 末尾追加的
           # 三方合并陷阱）。该条目仅注册单元测试，不影响主构建
           # （rdpclip-fd.c 已通过 libweston/backend-rdp/meson.build 编译进插件），
           # 但为保持测试覆盖，此处幂等补回。
+          # 已知问题 2（上游 #166 自身 bug）：#166 让 rdpclip.c 调用
+          # rdp_clipboard_take_fd（定义在新增的 rdpclip-fd.c），但
+          # test-rdp-teardown 的 plugin_rdp.extract_objects() 列表没有包含
+          # rdpclip-fd.c，导致链接 test-rdp-teardown 时 undefined reference。
+          # 此处幂等补上。
           python3 - <<'PY'
           s = open('tests/meson.build').read()
+          changed = False
+          # 问题 1：补回 rdpclip-fd 测试条目
           marker = "'rdpclip-fd',"
           if marker not in s:
               anchor = "['matrix', [], [ dep_libm, dep_matrix_c ]],"
               block = "['matrix', [], [ dep_libm, dep_matrix_c ]],\n\t[\n\t\t'rdpclip-fd',\n\t\t['../libweston/backend-rdp/rdpclip-fd.c'],\n\t\t[ dep_zucmain ],\n\t],"
               if anchor in s:
                   s = s.replace(anchor, block, 1)
-                  open('tests/meson.build', 'w').write(s)
+                  changed = True
                   print('补丁: rdpclip-fd 测试条目已补回 tests_standalone')
               else:
                   print('警告: 未找到 matrix 锚点，rdpclip-fd 测试条目未补回（不影响主构建）')
           else:
-              print('补丁: rdpclip-fd 已存在，跳过')
+              print('补丁: rdpclip-fd 测试条目已存在，跳过')
+          # 问题 2：test-rdp-teardown 的 extract_objects 补上 rdpclip-fd.c
+          # 锚点：extract_objects 列表中的 'rdpclip.c', 行（3 个 tab 缩进）
+          if "'rdpclip-fd.c'," not in s:
+              anchor2 = "\t\t\t'rdpclip.c',\n\t\t\t'rdprail.c',"
+              repl2 = "\t\t\t'rdpclip.c',\n\t\t\t'rdpclip-fd.c',\n\t\t\t'rdprail.c',"
+              if anchor2 in s:
+                  s = s.replace(anchor2, repl2, 1)
+                  changed = True
+                  print('补丁: test-rdp-teardown extract_objects 已补上 rdpclip-fd.c')
+              else:
+                  print('警告: 未找到 rdpclip.c/rdprail.c 锚点，extract_objects 未补（可能已存在或结构变化）')
+          else:
+              print('补丁: extract_objects 已含 rdpclip-fd.c，跳过')
+          if changed:
+              open('tests/meson.build', 'w').write(s)
           PY
           git add tests/meson.build
-          git commit --no-edit -m "Fix: restore rdpclip-fd test entry in tests/meson.build" 2>/dev/null || true
+          git commit --no-edit -m "Fix: restore rdpclip-fd test entry + extract_objects for test-rdp-teardown" 2>/dev/null || true
           git log --oneline -3
 
       - name: "合并 weston-mirror PR #172（弹窗定位与窗口同步）"
