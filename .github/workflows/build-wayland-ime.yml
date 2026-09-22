@@ -496,6 +496,48 @@ jobs:
           echo "tests/meson.build 校验全部通过"
           git log --oneline -4
 
+      - name: "修复 weston #172：popup 无 buffer 判定改用 width_from_buffer（IDEA 弹窗闪退根因）"
+        if: ${{ inputs.apply_weston_172 }}
+        run: |
+          set -euo pipefail
+          cd vendor/weston
+          # #172 在 libweston-desktop/surface.c 用 surface->buffer_ref.buffer 判断"popup 提交时没有
+          # buffer"（无 buffer 即 unmap，且 popup_unmapped 置位后永不再映射）。但 libweston 在每次
+          # 重绘之后就会释放 SHM 表面的 buffer_ref（libweston/compositor.c weston_output_repaint：
+          # 后端未设置 keep_buffer 时 weston_buffer_reference(&buffer_ref, NULL)），所以 popup 只要被
+          # 绘制过一次，之后任何不带新 attach 的 commit（JBR 的 frame 回调注册、set_window_geometry 等）
+          # 都会被误判为"无 buffer"而被 unmap，客户端收不到 popup_done——这就是 IDEA 菜单 / Ctrl+N
+          # 弹窗"闪一下就消失、之后隐形吃键盘"的根因（2026-09-22 用 WAYLAND_DEBUG 实证）。
+          # width_from_buffer 只在 wl_surface.attach 时更新，只有 NULL attach 才归零，是正确判据。
+          python3 - <<'PY'
+          import sys
+          p = 'libweston-desktop/surface.c'
+          s = open(p).read()
+          reps = [
+              ("\t\tif (surface->popup_mapped && !surface->surface->buffer_ref.buffer) {",
+               "\t\tif (surface->popup_mapped &&\n\t\t    surface->surface->width_from_buffer == 0) {"),
+              ("\tif (surface->popup && !surface->popup_mapped &&\n\t    surface->surface->buffer_ref.buffer) {",
+               "\tif (surface->popup && !surface->popup_mapped &&\n\t    surface->surface->width_from_buffer != 0) {"),
+              ("\t\tif (surface && surface->popup &&\n\t\t    !child->view->surface->buffer_ref.buffer)\n\t\t\tcontinue;",
+               "\t\tif (surface && surface->popup &&\n\t\t    child->view->surface->width_from_buffer == 0)\n\t\t\tcontinue;"),
+          ]
+          for old, new in reps:
+              if old not in s:
+                  sys.exit('ERROR: 未找到 #172 目标代码（PR 可能已更新），需人工检查:\n' + old)
+              s = s.replace(old, new, 1)
+          open(p, 'w').write(s)
+          print('补丁: surface.c 三处 buffer_ref 判定已改为 width_from_buffer')
+          PY
+          # 校验：working 分支原版 surface.c 不含 buffer_ref，#172 引入的三处应全部被替换
+          if grep -n "buffer_ref" libweston-desktop/surface.c; then
+            echo "::error::surface.c 仍残留 buffer_ref 判定，需人工检查"
+            exit 1
+          fi
+          grep -n "width_from_buffer" libweston-desktop/surface.c
+          git add libweston-desktop/surface.c
+          git commit --no-edit -m "Fix #172: detect bufferless popup commits via width_from_buffer, not buffer_ref (libweston releases buffer_ref after repaint)"
+          git log --oneline -3
+
       - name: 构建 system distro VHD（release）
         if: ${{ inputs.debug_build != true }}
         run: |
