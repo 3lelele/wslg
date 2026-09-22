@@ -538,6 +538,99 @@ jobs:
           git commit --no-edit -m "Fix #172: detect bufferless popup commits via width_from_buffer, not buffer_ref (libweston releases buffer_ref after repaint)"
           git log --oneline -3
 
+      - name: "修复 #169+#172 组合：xdg_popup 的 RAIL owner 设为父窗口（候选框弹出时搜索框被主窗口盖住）"
+        if: ${{ inputs.apply_weston_169 && inputs.apply_weston_172 }}
+        run: |
+          set -euo pipefail
+          cd vendor/weston
+          # 现象（2026-09-22 实证）：Ctrl+N 弹窗在 fcitx5 候选框出现的瞬间"消失"，候选框关闭、
+          # weston 重发 Z 序后又出现。weston 侧 Z 序与 view 全程正确，问题在 Windows 侧：
+          # #169 把输入面板的 RAIL owner 设为 text_input 所在主窗口（JBR 的 text-input 绑定在
+          # toplevel 上），而 xdg_popup 的 RAIL 窗口没有 owner（rdprail.c 只对 wl_subsurface 设
+          # parent）。Windows 激活一个 owned 窗口时会把整棵 owner 树（主窗口+候选框）提到最前，
+          # 无 owner 的 popup 就被压到主窗口后面。修法：popup 映射时（#172 新增的
+          # popup_state_changed 回调）用 #169 的 set_window_owner 把 owner 设为父 xdg surface。
+          # weston_desktop_surface_get_parent() 只在 internal.h 声明，需导出给 shell 插件使用。
+          python3 - <<'PY'
+          import sys
+
+          def patch(path, old, new, desc):
+              s = open(path).read()
+              if old not in s:
+                  sys.exit('ERROR: %s 目标代码未找到（上游/PR 可能已更新），需人工检查:\n%s' % (desc, old))
+              open(path, 'w').write(s.replace(old, new, 1))
+              print('补丁: ' + desc)
+
+          patch('libweston-desktop/surface.c',
+                "struct weston_desktop_surface *\n"
+                "weston_desktop_surface_get_parent(struct weston_desktop_surface *surface)\n"
+                "{\n"
+                "\treturn surface->parent;\n"
+                "}\n",
+                "WL_EXPORT struct weston_desktop_surface *\n"
+                "weston_desktop_surface_get_parent(struct weston_desktop_surface *surface)\n"
+                "{\n"
+                "\treturn surface->parent;\n"
+                "}\n",
+                'surface.c 导出 weston_desktop_surface_get_parent')
+
+          patch('include/libweston-desktop/libweston-desktop.h',
+                "struct weston_surface *\n"
+                "weston_desktop_surface_get_surface(struct weston_desktop_surface *surface);\n",
+                "struct weston_surface *\n"
+                "weston_desktop_surface_get_surface(struct weston_desktop_surface *surface);\n"
+                "struct weston_desktop_surface *\n"
+                "weston_desktop_surface_get_parent(struct weston_desktop_surface *surface);\n",
+                'libweston-desktop.h 声明 weston_desktop_surface_get_parent')
+
+          patch('rdprail-shell/shell.c',
+                "static void\n"
+                "desktop_popup_state_changed(struct weston_desktop_surface *desktop_surface,\n"
+                "\t\t\t    bool mapped, void *data)\n"
+                "{\n"
+                "\tstruct desktop_shell *shell = data;\n"
+                "\n"
+                "\tif (shell->rdprail_api->notify_popup_state)\n"
+                "\t\tshell->rdprail_api->notify_popup_state(\n"
+                "\t\t\tweston_desktop_surface_get_surface(desktop_surface), mapped);\n"
+                "}\n",
+                "static void\n"
+                "desktop_popup_state_changed(struct weston_desktop_surface *desktop_surface,\n"
+                "\t\t\t    bool mapped, void *data)\n"
+                "{\n"
+                "\tstruct desktop_shell *shell = data;\n"
+                "\tstruct weston_surface *surface =\n"
+                "\t\tweston_desktop_surface_get_surface(desktop_surface);\n"
+                "\n"
+                "\t/* Keep popups in their parent's RAIL owner tree: Windows raises the\n"
+                "\t * whole owner tree when it activates an owned window (e.g. the input\n"
+                "\t * panel owned by the toplevel), so an unowned popup would be covered\n"
+                "\t * by its own toplevel. */\n"
+                "\tif (mapped && shell->rdprail_api->set_window_owner) {\n"
+                "\t\tstruct weston_desktop_surface *parent =\n"
+                "\t\t\tweston_desktop_surface_get_parent(desktop_surface);\n"
+                "\n"
+                "\t\tif (parent) {\n"
+                "\t\t\tstruct weston_surface *owner =\n"
+                "\t\t\t\tweston_surface_get_main_surface(\n"
+                "\t\t\t\t\tweston_desktop_surface_get_surface(parent));\n"
+                "\n"
+                "\t\t\tif (owner && owner != surface)\n"
+                "\t\t\t\tshell->rdprail_api->set_window_owner(surface, owner);\n"
+                "\t\t}\n"
+                "\t}\n"
+                "\n"
+                "\tif (shell->rdprail_api->notify_popup_state)\n"
+                "\t\tshell->rdprail_api->notify_popup_state(surface, mapped);\n"
+                "}\n",
+                'shell.c popup 映射时设置 RAIL owner')
+          PY
+          grep -n "weston_desktop_surface_get_parent" include/libweston-desktop/libweston-desktop.h libweston-desktop/surface.c rdprail-shell/shell.c
+          grep -n "set_window_owner" rdprail-shell/shell.c include/libweston/backend-rdp.h
+          git add include/libweston-desktop/libweston-desktop.h libweston-desktop/surface.c rdprail-shell/shell.c
+          git commit --no-edit -m "rdprail-shell: give xdg_popup RAIL windows their parent as owner (keeps popups above toplevel when the input panel is activated)"
+          git log --oneline -3
+
       - name: 构建 system distro VHD（release）
         if: ${{ inputs.debug_build != true }}
         run: |
