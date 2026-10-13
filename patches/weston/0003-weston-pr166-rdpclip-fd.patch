@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wslg-patches <patches@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] weston-mirror #166: rdp-backend keeps the active clipboard
+ transfer fd
+
+Upstream PR:  https://github.com/microsoft/weston-mirror/pull/166
+PR head:      2c726f2d60d84b929efa2d5d5c84e69ef71322c8
+Fixes:        microsoft/wslg#1407 (compositor crash on copy/paste, e.g. IDEA)
+
+Integration fixes bundled here (not part of the upstream PR):
+
+- tests/meson.build: restore the rdpclip-fd standalone test entry that the
+  ort merge silently dropped (mid-list insert vs. end-of-list append).
+- tests/meson.build: add rdpclip-fd.c to test-rdp-teardown's extract_objects.
+  The upstream PR makes rdpclip.c call rdp_clipboard_take_fd() but forgot
+  to add the new file to that list, so test-rdp-teardown fails to link.
+---
+ libweston/backend-rdp/meson.build  |  1 +
+ libweston/backend-rdp/rdpclip-fd.c | 41 +++++++++++++++++
+ libweston/backend-rdp/rdpclip-fd.h | 34 ++++++++++++++
+ libweston/backend-rdp/rdpclip.c    | 16 ++++---
+ tests/meson.build                  |  6 +++
+ tests/rdpclip-fd-test.c            | 72 ++++++++++++++++++++++++++++++
+ 6 files changed, 163 insertions(+), 7 deletions(-)
+ create mode 100644 libweston/backend-rdp/rdpclip-fd.c
+ create mode 100644 libweston/backend-rdp/rdpclip-fd.h
+ create mode 100644 tests/rdpclip-fd-test.c
+
+diff --git a/libweston/backend-rdp/meson.build b/libweston/backend-rdp/meson.build
+index e7a80cf0..61906bfc 100644
+--- a/libweston/backend-rdp/meson.build
++++ b/libweston/backend-rdp/meson.build
+@@ -66,6 +66,7 @@ srcs_rdp = [
+         'rdp.c',
+         'rdpdisp.c',
+         'rdpclip.c',
++        'rdpclip-fd.c',
+         'rdprail.c',
+         'rdprail-window-state.c',
+         'rdputil.c',
+diff --git a/libweston/backend-rdp/rdpclip-fd.c b/libweston/backend-rdp/rdpclip-fd.c
+new file mode 100644
+index 00000000..b9254489
+--- /dev/null
++++ b/libweston/backend-rdp/rdpclip-fd.c
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2026 huyuliang
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "config.h"
++
++#include <unistd.h>
++
++#include "rdpclip-fd.h"
++
++int
++rdp_clipboard_take_fd(int current_fd, int incoming_fd)
++{
++	if (current_fd != -1) {
++		close(incoming_fd);
++		return current_fd;
++	}
++
++	return incoming_fd;
++}
+diff --git a/libweston/backend-rdp/rdpclip-fd.h b/libweston/backend-rdp/rdpclip-fd.h
+new file mode 100644
+index 00000000..22c35c59
+--- /dev/null
++++ b/libweston/backend-rdp/rdpclip-fd.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2026 huyuliang
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef RDPCLIP_FD_H
++#define RDPCLIP_FD_H
++
++/* Takes ownership of incoming_fd. Preserve current_fd when it is active and
++ * close incoming_fd; otherwise return incoming_fd. */
++int
++rdp_clipboard_take_fd(int current_fd, int incoming_fd);
++
++#endif /* RDPCLIP_FD_H */
+diff --git a/libweston/backend-rdp/rdpclip.c b/libweston/backend-rdp/rdpclip.c
+index d7ab5623..e9b471fe 100644
+--- a/libweston/backend-rdp/rdpclip.c
++++ b/libweston/backend-rdp/rdpclip.c
+@@ -36,6 +36,7 @@
+ #include <stdio.h>
+ 
+ #include "rdp.h"
++#include "rdpclip-fd.h"
+ 
+ #include "libweston-internal.h"
+ 
+@@ -105,7 +106,6 @@ enum rdp_clipboard_data_source_state {
+ 	RDP_CLIPBOARD_SOURCE_TRANSFERRED, /* completed transfering data to consumer */
+ 	RDP_CLIPBOARD_SOURCE_CANCEL_PENDING, /* data transfer cancel requested */
+ 	RDP_CLIPBOARD_SOURCE_CANCELED, /* data transfer canceled */
+-	RDP_CLIPBOARD_SOURCE_RETRY, /* retry later */
+ 	RDP_CLIPBOARD_SOURCE_FAILED, /* failure occured */
+ };
+ 
+@@ -162,8 +162,6 @@ clipboard_data_source_state_to_string(struct rdp_clipboard_data_source *source)
+ 		return "cancel pending";
+ 	case RDP_CLIPBOARD_SOURCE_CANCELED:
+ 		return "canceled";
+-	case RDP_CLIPBOARD_SOURCE_RETRY:
+-		return "retry";
+ 	case RDP_CLIPBOARD_SOURCE_FAILED:
+ 		return "failed";
+ 	}
+@@ -1108,9 +1106,11 @@ clipboard_data_source_send(struct weston_data_source *base,
+ 			   clipboard_data_source_state_to_string(ctx->clipboard_inflight_client_data_source),
+ 			   ctx->clipboard_inflight_client_data_source->data_source_fd);
+ 		if (source == ctx->clipboard_inflight_client_data_source) {
+-			/* when new source and previous source is same, update fd with new one and retry */
+-			source->state = RDP_CLIPBOARD_SOURCE_RETRY;
+-			ctx->clipboard_inflight_client_data_source->data_source_fd = fd;
++			/* Keep the active transfer intact. The requester may retry
++			 * after receiving EOF on the new fd. */
++			assert(source->data_source_fd != -1);
++			source->data_source_fd =
++				rdp_clipboard_take_fd(source->data_source_fd, fd);
+ 			return;
+ 		} else {
+ 			source->state = RDP_CLIPBOARD_SOURCE_FAILED;
+@@ -1130,7 +1130,9 @@ clipboard_data_source_send(struct weston_data_source *base,
+ 	    source->client_format_id_table[index]) {	/* check supported by current data source from client */
+ 		ctx->clipboard_inflight_client_data_source = source;
+ 		source->refcount++; /* reference while request inflight. */
+-		source->data_source_fd = fd;
++		assert(source->data_source_fd == -1);
++		source->data_source_fd =
++			rdp_clipboard_take_fd(source->data_source_fd, fd);
+ 		assert(source->inflight_write_count == 0);
+ 		assert(source->inflight_data_to_write == NULL);
+ 		assert(source->inflight_data_size == 0);
+diff --git a/tests/meson.build b/tests/meson.build
+index 9bef3e4e..272becae 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -265,6 +265,11 @@ endif
+ tests_standalone = [
+ 	['config-parser', [], [ dep_zucmain ]],
+ 	['matrix', [], [ dep_libm, dep_matrix_c ]],
++	[
++		'rdpclip-fd',
++		['../libweston/backend-rdp/rdpclip-fd.c'],
++		[ dep_zucmain ],
++	],
+ 	['timespec', [], [ dep_zucmain ]],
+ 	['zuc',
+ 		[
+@@ -296,6 +301,7 @@ if get_option('backend-rdp')
+ 			'hash.c',
+ 			'rdpdisp.c',
+ 			'rdpclip.c',
++			'rdpclip-fd.c',
+ 			'rdprail.c',
+ 			'rdprail-window-state.c',
+ 			'rdputil.c',
+diff --git a/tests/rdpclip-fd-test.c b/tests/rdpclip-fd-test.c
+new file mode 100644
+index 00000000..2bed061c
+--- /dev/null
++++ b/tests/rdpclip-fd-test.c
+@@ -0,0 +1,72 @@
++/*
++ * Copyright 2026 huyuliang
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include "libweston/backend-rdp/rdpclip-fd.h"
++#include "zunitc/zunitc.h"
++
++ZUC_TEST(rdpclip_fd_test, accepts_fd_without_active_transfer)
++{
++	int pipefd[2];
++	int active_fd;
++
++	ZUC_ASSERT_EQ(0, pipe(pipefd));
++
++	active_fd = rdp_clipboard_take_fd(-1, pipefd[1]);
++
++	ZUC_ASSERT_EQ(pipefd[1], active_fd);
++	ZUC_ASSERT_NE(-1, fcntl(active_fd, F_GETFD));
++
++	close(active_fd);
++	close(pipefd[0]);
++}
++
++ZUC_TEST(rdpclip_fd_test, preserves_active_fd_and_closes_incoming_fd)
++{
++	int active_pipefd[2];
++	int incoming_pipefd[2];
++	int active_fd;
++
++	ZUC_ASSERT_EQ(0, pipe(active_pipefd));
++	ZUC_ASSERT_EQ(0, pipe(incoming_pipefd));
++
++	active_fd = rdp_clipboard_take_fd(active_pipefd[1],
++					  incoming_pipefd[1]);
++
++	ZUC_ASSERT_EQ(active_pipefd[1], active_fd);
++	ZUC_ASSERT_NE(-1, fcntl(active_fd, F_GETFD));
++	errno = 0;
++	ZUC_ASSERT_EQ(-1, fcntl(incoming_pipefd[1], F_GETFD));
++	ZUC_ASSERT_EQ(EBADF, errno);
++
++	close(active_fd);
++	close(active_pipefd[0]);
++	close(incoming_pipefd[0]);
++}

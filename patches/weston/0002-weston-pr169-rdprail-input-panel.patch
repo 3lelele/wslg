@@ -1,0 +1,2657 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wslg-patches <patches@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] weston-mirror #169: rdprail-shell input panel for external
+ input methods
+
+Upstream PR:  https://github.com/microsoft/weston-mirror/pull/169
+PR head:      830e0ccab845fc4d50500d000b3963e492436e07
+
+Gives the external input method's candidate window a RAIL window of its
+own, owned by the toplevel that holds the text_input focus.
+
+Integration fixes bundled here (not part of the upstream PR):
+
+- tests/meson.build: deterministic union of the #168 and #169 test
+  registrations. Both PRs append adjacent entries to the same list, which
+  git's 3-way merge cannot combine (and the built-in union driver
+  interleaves the two sides and breaks the meson syntax).
+- tests/meson.build: add rdprail-window-state.c to the test-rdp-teardown
+  extract_objects list. rdprail.c now calls rdp_rail_prepare_window_state_
+  order()/rdp_rail_send_window_state_order() defined in that new file, and
+  `ninja install` builds the test executables, so without it the build
+  fails with an undefined reference.
+---
+ compositor/text-backend.c                    |   7 +-
+ include/libweston/backend-rdp.h              |  14 +
+ libweston/backend-rdp/meson.build            |   1 +
+ libweston/backend-rdp/rdprail-window-state.c |  84 +++
+ libweston/backend-rdp/rdprail-window-state.h |  45 ++
+ libweston/backend-rdp/rdprail.c              | 221 +++++--
+ man/weston.ini.man                           |   6 +
+ protocol/meson.build                         |   1 +
+ protocol/weston-rdprail-test.xml             |  43 ++
+ protocol/weston-test.xml                     |  16 +
+ rdprail-shell/input-panel.c                  | 339 +++++++++-
+ rdprail-shell/shell.c                        |   3 +
+ rdprail-shell/shell.h                        |   6 +
+ tests/input-method-bind-test.c               | 120 ++++
+ tests/input-method-external-allow.ini        |   3 +
+ tests/input-method-external-deny.ini         |   2 +
+ tests/meson.build                            | 109 +++-
+ tests/rdprail-input-panel-test.c             | 611 +++++++++++++++++++
+ tests/rdprail-input-panel.ini                |   3 +
+ tests/rdprail-test.c                         | 107 ++++
+ tests/rdprail-window-state-test.c            | 172 ++++++
+ tests/weston-test-client-helper.c            |  29 +
+ tests/weston-test-client-helper.h            |  13 +
+ tests/weston-test-fixture-compositor.c       |   4 +
+ tests/weston-test-fixture-compositor.h       |   4 +-
+ tests/weston-test.c                          |  73 +++
+ 26 files changed, 1948 insertions(+), 88 deletions(-)
+ create mode 100644 libweston/backend-rdp/rdprail-window-state.c
+ create mode 100644 libweston/backend-rdp/rdprail-window-state.h
+ create mode 100644 protocol/weston-rdprail-test.xml
+ create mode 100644 tests/input-method-bind-test.c
+ create mode 100644 tests/input-method-external-allow.ini
+ create mode 100644 tests/input-method-external-deny.ini
+ create mode 100644 tests/rdprail-input-panel-test.c
+ create mode 100644 tests/rdprail-input-panel.ini
+ create mode 100644 tests/rdprail-test.c
+ create mode 100644 tests/rdprail-window-state-test.c
+
+diff --git a/compositor/text-backend.c b/compositor/text-backend.c
+index 14bd92fa..da460a63 100644
+--- a/compositor/text-backend.c
++++ b/compositor/text-backend.c
+@@ -144,6 +144,7 @@ struct text_backend {
+ 	struct {
+ 		char *path;
+ 		struct wl_client *client;
++		bool allow_external;
+ 
+ 		unsigned deathcount;
+ 		struct timespec deathstamp;
+@@ -1451,7 +1452,8 @@ bind_input_method(struct wl_client *client,
+ 		return;
+ 	}
+ 
+-	if (text_backend->input_method.client != client) {
++	if (!text_backend->input_method.allow_external &&
++	    text_backend->input_method.client != client) {
+ 		wl_resource_post_error(resource,
+ 				       WL_DISPLAY_ERROR_INVALID_OBJECT,
+ 				       "permission to bind "
+@@ -1688,6 +1690,9 @@ text_backend_configuration(struct text_backend *text_backend)
+ 	weston_config_section_get_string(section, "path",
+ 					 &text_backend->input_method.path,
+ 					 client);
++	weston_config_section_get_bool(
++		section, "allow-external",
++		&text_backend->input_method.allow_external, false);
+ 	free(client);
+ }
+ 
+diff --git a/include/libweston/backend-rdp.h b/include/libweston/backend-rdp.h
+index 2140ac05..4ccbde21 100644
+--- a/include/libweston/backend-rdp.h
++++ b/include/libweston/backend-rdp.h
+@@ -194,6 +194,16 @@ struct weston_rdprail_api {
+ 	/** Notify window proxy surface
+ 	 */
+ 	void (*notify_window_proxy_surface)(struct weston_surface *proxy_surface);
++
++	/** Set the RAIL owner of a surface.
++	 */
++	void (*set_window_owner)(struct weston_surface *surface,
++				 struct weston_surface *owner);
++
++	/** Update the RAIL visibility of a surface.
++	 */
++	void (*set_window_visible)(struct weston_surface *surface,
++				   bool visible);
+ };
+ 
+ static inline const struct weston_rdprail_api *
+@@ -263,6 +273,10 @@ struct weston_surface_rail_state {
+ 
+ 	/* rdpgfx surface */
+ 	uint32_t surface_id;
++
++	struct weston_surface *surface;
++	struct wl_listener parent_destroy_listener;
++	bool has_requested_visibility;
+ };
+ 
+ #define WESTON_RDP_BACKEND_CONFIG_VERSION 3
+diff --git a/libweston/backend-rdp/meson.build b/libweston/backend-rdp/meson.build
+index 7d5d227d..e7a80cf0 100644
+--- a/libweston/backend-rdp/meson.build
++++ b/libweston/backend-rdp/meson.build
+@@ -67,6 +67,7 @@ srcs_rdp = [
+         'rdpdisp.c',
+         'rdpclip.c',
+         'rdprail.c',
++        'rdprail-window-state.c',
+         'rdputil.c',
+ ]
+ 
+diff --git a/libweston/backend-rdp/rdprail-window-state.c b/libweston/backend-rdp/rdprail-window-state.c
+new file mode 100644
+index 00000000..6f1dfc7f
+--- /dev/null
++++ b/libweston/backend-rdp/rdprail-window-state.c
+@@ -0,0 +1,84 @@
++/*
++ * Copyright 2026 Microsoft Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "config.h"
++
++#include <assert.h>
++#include <stdbool.h>
++
++#include <libweston/backend-rdp.h>
++
++#include "rdprail-window-state.h"
++
++uint32_t
++rdp_rail_prepare_window_state_order(uint32_t previous_owner,
++				    uint32_t requested_owner,
++				    uint32_t previous_show_state,
++				    uint32_t requested_show_state,
++				    WINDOW_ORDER_INFO *order_info,
++				    WINDOW_STATE_ORDER *window_state)
++{
++	uint32_t fields = 0;
++
++	if (previous_owner != requested_owner) {
++		fields |= WINDOW_ORDER_FIELD_OWNER;
++		window_state->ownerWindowId = requested_owner;
++	}
++
++	if (previous_show_state != requested_show_state) {
++		fields |= WINDOW_ORDER_FIELD_SHOW;
++		switch (requested_show_state) {
++		case RDP_WINDOW_HIDE:
++			window_state->showState = WINDOW_HIDE;
++			break;
++		case RDP_WINDOW_SHOW:
++			window_state->showState = WINDOW_SHOW;
++			break;
++		case RDP_WINDOW_SHOW_MINIMIZED:
++			window_state->showState = WINDOW_SHOW_MINIMIZED;
++			break;
++		case RDP_WINDOW_SHOW_MAXIMIZED:
++			window_state->showState = WINDOW_SHOW_MAXIMIZED;
++			break;
++		case RDP_WINDOW_SHOW_FULLSCREEN:
++			window_state->showState = WINDOW_SHOW;
++			break;
++		default:
++			assert(false);
++		}
++	}
++
++	order_info->fieldFlags |= fields;
++	return fields;
++}
++
++void
++rdp_rail_send_window_state_order(rdpUpdate *update,
++				 const WINDOW_ORDER_INFO *order_info,
++				 const WINDOW_STATE_ORDER *window_state)
++{
++	update->BeginPaint(update->context);
++	update->window->WindowUpdate(update->context, order_info, window_state);
++	update->EndPaint(update->context);
++}
+diff --git a/libweston/backend-rdp/rdprail-window-state.h b/libweston/backend-rdp/rdprail-window-state.h
+new file mode 100644
+index 00000000..b1f65a8a
+--- /dev/null
++++ b/libweston/backend-rdp/rdprail-window-state.h
+@@ -0,0 +1,45 @@
++/*
++ * Copyright 2026 Microsoft Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef RDPRAIL_WINDOW_STATE_H
++#define RDPRAIL_WINDOW_STATE_H
++
++#include <stdint.h>
++
++#include <freerdp/update.h>
++
++uint32_t
++rdp_rail_prepare_window_state_order(uint32_t previous_owner,
++				    uint32_t requested_owner,
++				    uint32_t previous_show_state,
++				    uint32_t requested_show_state,
++				    WINDOW_ORDER_INFO *order_info,
++				    WINDOW_STATE_ORDER *window_state);
++
++void
++rdp_rail_send_window_state_order(rdpUpdate *update,
++				 const WINDOW_ORDER_INFO *order_info,
++				 const WINDOW_STATE_ORDER *window_state);
++
++#endif /* RDPRAIL_WINDOW_STATE_H */
+diff --git a/libweston/backend-rdp/rdprail.c b/libweston/backend-rdp/rdprail.c
+index 995ea933..06e2497c 100644
+--- a/libweston/backend-rdp/rdprail.c
++++ b/libweston/backend-rdp/rdprail.c
+@@ -43,6 +43,7 @@
+ #include <strings.h>
+ 
+ #include "rdp.h"
++#include "rdprail-window-state.h"
+ 
+ #include "libweston-internal.h"
+ #include "shared/xalloc.h"
+@@ -1482,6 +1483,127 @@ rdp_showstate_to_string(uint32_t showstate)
+ 	}
+ }
+ 
++static uint32_t
++rdp_rail_window_owner_id(struct weston_surface_rail_state *rail_state)
++{
++	struct weston_surface_rail_state *parent_rail_state;
++
++	if (!rail_state->parent_surface ||
++	    !rail_state->parent_surface->backend_state)
++		return RDP_RAIL_DESKTOP_WINDOW_ID;
++
++	parent_rail_state = rail_state->parent_surface->backend_state;
++	if (!parent_rail_state->window_id)
++		return RDP_RAIL_DESKTOP_WINDOW_ID;
++
++	return parent_rail_state->window_id;
++}
++
++static void
++rdp_rail_update_window_state(struct weston_surface *surface)
++{
++	struct weston_surface_rail_state *rail_state = surface->backend_state;
++	struct rdp_backend *b = to_rdp_backend(surface->compositor);
++	WINDOW_ORDER_INFO window_order_info = {};
++	WINDOW_STATE_ORDER window_state_order = {};
++	uint32_t state_fields;
++	uint32_t owner_window_id;
++	rdpUpdate *update;
++
++	if (!rail_state || !rail_state->window_id || rail_state->isCursor ||
++	    !b || !b->rdp_peer || !b->rdp_peer->context)
++		return;
++
++	owner_window_id = rdp_rail_window_owner_id(rail_state);
++	window_order_info.windowId = rail_state->window_id;
++	window_order_info.fieldFlags = WINDOW_ORDER_TYPE_WINDOW;
++	state_fields = rdp_rail_prepare_window_state_order(
++		rail_state->parent_window_id, owner_window_id,
++		rail_state->showState, rail_state->showState_requested,
++		&window_order_info, &window_state_order);
++
++	if (state_fields & WINDOW_ORDER_FIELD_OWNER)
++		rail_state->parent_window_id = owner_window_id;
++	if (state_fields & WINDOW_ORDER_FIELD_SHOW)
++		rail_state->showState = rail_state->showState_requested;
++
++	if (!state_fields)
++		return;
++
++	update = b->rdp_peer->context->update;
++	rdp_rail_send_window_state_order(update, &window_order_info,
++					 &window_state_order);
++}
++
++static void
++rdp_rail_handle_parent_destroy(struct wl_listener *listener, void *data)
++{
++	struct weston_surface_rail_state *rail_state =
++		container_of(listener, struct weston_surface_rail_state,
++			     parent_destroy_listener);
++
++	rail_state->parent_surface = NULL;
++	rail_state->parent_destroy_listener.notify = NULL;
++	rdp_rail_update_window_state(rail_state->surface);
++
++	(void)data;
++}
++
++static struct weston_surface_rail_state *
++rdp_rail_get_window_state(struct weston_surface *surface)
++{
++	struct weston_surface_rail_state *rail_state = surface->backend_state;
++
++	if (rail_state)
++		return rail_state;
++
++	rail_state = xzalloc(sizeof *rail_state);
++	rail_state->surface = surface;
++	rail_state->destroy_listener.notify = rdp_rail_destroy_window;
++	wl_signal_add(&surface->destroy_signal, &rail_state->destroy_listener);
++	surface->backend_state = rail_state;
++
++	return rail_state;
++}
++
++static void
++rdp_rail_set_window_owner(struct weston_surface *surface,
++			  struct weston_surface *owner)
++{
++	struct weston_surface_rail_state *rail_state;
++
++	rail_state = rdp_rail_get_window_state(surface);
++	if (rail_state->parent_surface == owner)
++		return;
++
++	if (rail_state->parent_destroy_listener.notify) {
++		wl_list_remove(&rail_state->parent_destroy_listener.link);
++		rail_state->parent_destroy_listener.notify = NULL;
++	}
++
++	rail_state->parent_surface = owner;
++	if (owner) {
++		rail_state->parent_destroy_listener.notify =
++			rdp_rail_handle_parent_destroy;
++		wl_signal_add(&owner->destroy_signal,
++			      &rail_state->parent_destroy_listener);
++	}
++
++	rdp_rail_update_window_state(surface);
++}
++
++static void
++rdp_rail_set_window_visible(struct weston_surface *surface, bool visible)
++{
++	struct weston_surface_rail_state *rail_state;
++
++	rail_state = rdp_rail_get_window_state(surface);
++	rail_state->showState_requested = visible ? RDP_WINDOW_SHOW :
++		RDP_WINDOW_HIDE;
++	rail_state->has_requested_visibility = true;
++	rdp_rail_update_window_state(surface);
++}
++
+ static void
+ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ {
+@@ -1548,14 +1670,10 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ 		return;
+ 	}
+ 
+-	if (!rail_state) {
+-		rail_state = xzalloc(sizeof *rail_state);
+-		surface->backend_state = rail_state;
+-	} else {
+-		/* If ever encouter error for this window, no more attempt to create window */
+-		if (rail_state->error)
+-			return;
+-	}
++	rail_state = rdp_rail_get_window_state(surface);
++	/* Do not retry window creation after an error. */
++	if (rail_state->error)
++		return;
+ 
+ 	/* windowId can be assigned only after activation completed */
+ 	if (!rdp_id_manager_allocate_id(&peer_ctx->windowId, surface, &window_id)) {
+@@ -1565,11 +1683,6 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ 		return;
+ 	}
+ 	rail_state->window_id = window_id;
+-	/* Once this surface is inserted to hash table, we want to be notified for destroy */
+-	assert(!rail_state->destroy_listener.notify);
+-	rail_state->destroy_listener.notify = rdp_rail_destroy_window;
+-	wl_signal_add(&surface->destroy_signal, &rail_state->destroy_listener);
+-
+ 	if (surface->role_name != NULL) {
+ 		if (strcmp(surface->role_name, "wl_subsurface") == 0) {
+ 			rail_state->parent_surface = weston_surface_get_main_surface(surface);
+@@ -1661,15 +1774,7 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ 	window_state_order.extendedStyle = WS_EX_LAYERED;
+ 
+ 	window_order_info.fieldFlags |= WINDOW_ORDER_FIELD_OWNER;
+-	if (rail_state->parent_surface &&
+-	    rail_state->parent_surface->backend_state) {
+-		struct weston_surface_rail_state *parent_rail_state =
+-			rail_state->parent_surface->backend_state;
+-
+-		window_state_order.ownerWindowId = parent_rail_state->window_id;
+-	} else {
+-		window_state_order.ownerWindowId = RDP_RAIL_DESKTOP_WINDOW_ID;
+-	}
++	window_state_order.ownerWindowId = rdp_rail_window_owner_id(rail_state);
+ 
+ 	/* window is created with hidden and no taskbar icon always, and
+ 	   it become visbile when window has some contents to show. */
+@@ -1746,7 +1851,8 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ 	rail_state->taskbarButton = window_state_order.TaskbarButton;
+ 	assert(window_state_order.showState == WINDOW_HIDE);
+ 	rail_state->showState = RDP_WINDOW_HIDE;
+-	rail_state->showState_requested = RDP_WINDOW_SHOW; // show window at following update.
++	if (!rail_state->has_requested_visibility)
++		rail_state->showState_requested = RDP_WINDOW_SHOW;
+ 	pixman_region32_init_rect(&rail_state->damage, 0, 0,
+ 				  surface->width_from_buffer,
+ 				  surface->height_from_buffer);
+@@ -1914,12 +2020,17 @@ rdp_rail_destroy_window(struct wl_listener *listener, void *data)
+ 		rail_state->repaint_listener.notify = NULL;
+ 	}
+ 
++Exit:
+ 	if (rail_state->destroy_listener.notify) {
+ 		wl_list_remove(&rail_state->destroy_listener.link);
+ 		rail_state->destroy_listener.notify = NULL;
+ 	}
+ 
+-Exit:
++	if (rail_state->parent_destroy_listener.notify) {
++		wl_list_remove(&rail_state->parent_destroy_listener.link);
++		rail_state->parent_destroy_listener.notify = NULL;
++	}
++
+ 	free(rail_state);
+ 	surface->backend_state = NULL;
+ 
+@@ -2008,6 +2119,8 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 	int numViews;
+ 	struct weston_view *view;
+ 	uint32_t window_id;
++	uint32_t owner_window_id;
++	uint32_t state_fields;
+ 	RdpPeerContext *peer_ctx = (RdpPeerContext *)b->rdp_peer->context;
+ 	uint32_t new_surface_id = 0;
+ 	uint32_t old_surface_id = 0;
+@@ -2197,35 +2310,32 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 	}
+ 
+ 	/* Adjust the Windows size and position on the screen */
++	owner_window_id = rdp_rail_window_owner_id(rail_state);
+ 	if (rail_state->clientPos.x != newClientPos.x ||
+ 	    rail_state->clientPos.y != newClientPos.y ||
+ 	    rail_state->clientPos.width != newClientPos.width ||
+ 	    rail_state->clientPos.height != newClientPos.height ||
++	    rail_state->parent_window_id != owner_window_id ||
+ 	    rail_state->showState != rail_state->showState_requested ||
+ 	    rail_state->get_label != surface->get_label ||
+ 	    rail_state->forceUpdateWindowState) {
+   		window_order_info.windowId = window_id;
+ 		window_order_info.fieldFlags =
+ 			WINDOW_ORDER_TYPE_WINDOW;
++		state_fields = rdp_rail_prepare_window_state_order(
++			rail_state->parent_window_id, owner_window_id,
++			rail_state->showState, rail_state->showState_requested,
++			&window_order_info, &window_state_order);
+ 
+-		if (rail_state->parent_surface &&
+-		    rail_state->parent_surface->backend_state) {
+-			struct weston_surface_rail_state *parent_rail_state =
+-				rail_state->parent_surface->backend_state;
+-			if (rail_state->parent_window_id != parent_rail_state->window_id) {
+-				window_order_info.fieldFlags |= WINDOW_ORDER_FIELD_OWNER;
+-
+-				window_state_order.ownerWindowId = parent_rail_state->window_id;
+-
+-				rail_state->parent_window_id = parent_rail_state->window_id;
++		if (state_fields & WINDOW_ORDER_FIELD_OWNER) {
++			rail_state->parent_window_id = owner_window_id;
+ 
+-				rdp_debug_verbose(b, "WindowUpdate(0x%x - parent window id:%x)\n",
+-						  window_id,
+-						  rail_state->parent_window_id);
+-			}
++			rdp_debug_verbose(b, "WindowUpdate(0x%x - parent window id:%x)\n",
++					  window_id,
++					  rail_state->parent_window_id);
+ 		}
+ 
+-		if (rail_state->showState != rail_state->showState_requested) {
++		if (state_fields & WINDOW_ORDER_FIELD_SHOW) {
+ 			rdp_debug_verbose(b, "WindowUpdate(0x%x - showState:%s -> %s)\n",
+ 					  window_id,
+ 					  rdp_showstate_to_string(rail_state->showState),
+@@ -2238,35 +2348,19 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 				/* force update window geometry */
+ 				rail_state->forceUpdateWindowState = true;
+ 			}
+-			window_order_info.fieldFlags |= WINDOW_ORDER_FIELD_SHOW;
+-			switch (rail_state->showState_requested) {
+-			case RDP_WINDOW_HIDE:
+-				window_state_order.showState = WINDOW_HIDE;
+-				break;
+-			case RDP_WINDOW_SHOW:
+-				/* if previoulsy hidden, send minmax info */
+-				if (rail_state->showState == WINDOW_HIDE &&
++			if (rail_state->showState_requested == RDP_WINDOW_SHOW) {
++				/* if previously hidden, send minmax info */
++				if (rail_state->showState == RDP_WINDOW_HIDE &&
+ 				    api && api->request_window_minmax_info)
+ 					api->request_window_minmax_info(surface);
+-				window_state_order.showState = WINDOW_SHOW;
+-				break;
+-			case RDP_WINDOW_SHOW_MINIMIZED:
+-				window_state_order.showState = WINDOW_SHOW_MINIMIZED;
+-				break;
+-			case RDP_WINDOW_SHOW_MAXIMIZED:
+-				window_state_order.showState = WINDOW_SHOW_MAXIMIZED;
+-				break;
+-			case RDP_WINDOW_SHOW_FULLSCREEN:
++			} else if (rail_state->showState_requested ==
++				   RDP_WINDOW_SHOW_FULLSCREEN) {
+ 				/* fullscreen is treat as normal window at Window's client */
+-				window_state_order.showState = WINDOW_SHOW;
+ 				/* entering fullscreen mode, change window style */
+ 				window_order_info.fieldFlags |= WINDOW_ORDER_FIELD_STYLE;
+ 				window_state_order.style = RAIL_WINDOW_FULLSCREEN_STYLE;
+ 				/* force update window geometry */
+ 				rail_state->forceUpdateWindowState = true;
+-				break;
+-			default:
+-				assert(false);
+ 			}
+ 			rail_state->showState = rail_state->showState_requested;
+ 		}
+@@ -2486,9 +2580,8 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 		}
+ 
+ 		update = b->rdp_peer->context->update;
+-		update->BeginPaint(update->context);
+-		update->window->WindowUpdate(update->context, &window_order_info, &window_state_order);
+-		update->EndPaint(update->context);
++		rdp_rail_send_window_state_order(update, &window_order_info,
++						 &window_state_order);
+ 
+ 		free(rail_window_title_string.string);
+ 
+@@ -4854,6 +4947,8 @@ struct weston_rdprail_api rdprail_api = {
+ 	.get_primary_output = rdp_rail_get_primary_output,
+ 	.notify_window_zorder_change = rdp_rail_notify_window_zorder_change,
+ 	.notify_window_proxy_surface = rdp_rail_notify_window_proxy_surface,
++	.set_window_owner = rdp_rail_set_window_owner,
++	.set_window_visible = rdp_rail_set_window_visible,
+ };
+ 
+ int
+diff --git a/man/weston.ini.man b/man/weston.ini.man
+index e1364c63..53128fca 100644
+--- a/man/weston.ini.man
++++ b/man/weston.ini.man
+@@ -565,6 +565,12 @@ request. Currently, this option is supported by kiosk-shell.
+ .BI "path=" "@weston_libexecdir@/weston-keyboard"
+ sets the path of the on screen keyboard input method (string).
+ .RE
++.TP 7
++.BI "allow-external=" false
++Allows the first external client to bind the privileged input method protocol.
++This should only be enabled when the compositor does not launch the input
++method itself and the clients connected to the compositor are trusted.
++.RE
+ .RE
+ .SH "KEYBOARD SECTION"
+ This section contains the following keys:
+diff --git a/protocol/meson.build b/protocol/meson.build
+index 991019c8..710a909d 100644
+--- a/protocol/meson.build
++++ b/protocol/meson.build
+@@ -30,6 +30,7 @@ generated_protocols = [
+ 	[ 'viewporter', 'stable' ],
+ 	[ 'weston-debug', 'internal' ],
+ 	[ 'weston-desktop-shell', 'internal' ],
++	[ 'weston-rdprail-test', 'internal' ],
+ 	[ 'weston-rdprail-shell', 'internal' ],
+ 	[ 'weston-screenshooter', 'internal' ],
+ 	[ 'weston-content-protection', 'internal' ],
+diff --git a/protocol/weston-rdprail-test.xml b/protocol/weston-rdprail-test.xml
+new file mode 100644
+index 00000000..1aff9c95
+--- /dev/null
++++ b/protocol/weston-rdprail-test.xml
+@@ -0,0 +1,43 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="weston_rdprail_test">
++
++  <copyright>
++    Copyright 2026 Microsoft Corporation
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <interface name="weston_rdprail_test" version="1">
++    <description summary="RDPRAIL internal testing">
++      Test-only access to RDPRAIL behavior. This interface is implemented by
++      an uninstalled test module and must not be used outside the test suite.
++    </description>
++    <request name="get_window_state">
++      <arg name="surface" type="object" interface="wl_surface"/>
++      <arg name="owner" type="object" interface="wl_surface"
++           allow-null="true"/>
++    </request>
++    <event name="window_state">
++      <arg name="owner_matches" type="uint"/>
++      <arg name="show_state_requested" type="uint"/>
++    </event>
++  </interface>
++
++</protocol>
+diff --git a/protocol/weston-test.xml b/protocol/weston-test.xml
+index 00b7185d..1202ffb4 100644
+--- a/protocol/weston-test.xml
++++ b/protocol/weston-test.xml
+@@ -105,6 +105,22 @@
+       <arg name="y" type="fixed"/>
+       <arg name="touch_type" type="uint"/>
+     </request>
++    <request name="destroy_output">
++      <arg name="output" type="object" interface="wl_output"/>
++    </request>
++    <request name="set_output_mode">
++      <arg name="output" type="object" interface="wl_output"/>
++      <arg name="width" type="int"/>
++      <arg name="height" type="int"/>
++    </request>
++    <request name="get_surface_state">
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
++    <event name="surface_state">
++      <arg name="mapped" type="uint"/>
++      <arg name="x" type="fixed"/>
++      <arg name="y" type="fixed"/>
++    </event>
+   </interface>
+ 
+   <interface name="weston_test_runner" version="1">
+diff --git a/rdprail-shell/input-panel.c b/rdprail-shell/input-panel.c
+index ad837c23..786aa17e 100644
+--- a/rdprail-shell/input-panel.c
++++ b/rdprail-shell/input-panel.c
+@@ -30,6 +30,8 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include <libweston/backend-rdp.h>
++
+ #include "shell.h"
+ #include "input-method-unstable-v1-server-protocol.h"
+ #include "shared/helpers.h"
+@@ -40,30 +42,249 @@ struct input_panel_surface {
+ 
+ 	struct desktop_shell *shell;
+ 
++	struct wl_list link;
+ 	struct weston_surface *surface;
++	struct weston_view *view;
+ 	struct wl_listener surface_destroy_listener;
++	struct wl_listener output_destroy_listener;
++	struct wl_event_source *hide_idle;
++
++	struct weston_output *output;
++	uint32_t panel;
++	bool role_set;
+ };
+ 
++static void
++hide_input_panels_now(struct desktop_shell *shell);
++
++static void
++input_panel_handle_owner_destroy(struct wl_listener *listener, void *data)
++{
++	struct desktop_shell *shell =
++		container_of(listener, struct desktop_shell,
++			     text_input.surface_destroy_listener);
++
++	shell->text_input.surface = NULL;
++	shell->text_input.surface_destroy_listener.notify = NULL;
++	hide_input_panels_now(shell);
++
++	(void)data;
++}
++
++static void
++input_panel_set_owner(struct desktop_shell *shell,
++		      struct weston_surface *surface)
++{
++	if (shell->text_input.surface_destroy_listener.notify) {
++		wl_list_remove(&shell->text_input.surface_destroy_listener.link);
++		shell->text_input.surface_destroy_listener.notify = NULL;
++	}
++
++	shell->text_input.surface = surface;
++	if (!surface)
++		return;
++
++	shell->text_input.surface_destroy_listener.notify =
++		input_panel_handle_owner_destroy;
++	wl_signal_add(&surface->destroy_signal,
++		      &shell->text_input.surface_destroy_listener);
++}
++
++static void
++input_panel_surface_set_rail_visibility(struct input_panel_surface *ipsurf,
++					bool visible)
++{
++	const struct weston_rdprail_api *api = ipsurf->shell->rdprail_api;
++
++	if (api->set_window_visible)
++		api->set_window_visible(ipsurf->surface, visible);
++}
++
++static void
++hide_input_panel_surface(struct input_panel_surface *ipsurf)
++{
++	if (ipsurf->hide_idle) {
++		wl_event_source_remove(ipsurf->hide_idle);
++		ipsurf->hide_idle = NULL;
++	}
++
++	if (!weston_surface_is_mapped(ipsurf->surface))
++		return;
++
++	/* RAIL needs the hide update before unmapping clears output_mask. */
++	input_panel_surface_set_rail_visibility(ipsurf, false);
++	weston_surface_unmap(ipsurf->surface);
++}
++
++static void
++hide_input_panel_surface_idle(void *data)
++{
++	struct input_panel_surface *ipsurf = data;
++
++	ipsurf->hide_idle = NULL;
++	hide_input_panel_surface(ipsurf);
++}
++
++static void
++input_panel_handle_output_destroy(struct wl_listener *listener, void *data)
++{
++	struct input_panel_surface *ipsurf =
++		container_of(listener, struct input_panel_surface,
++			     output_destroy_listener);
++
++	ipsurf->output = NULL;
++	ipsurf->output_destroy_listener.notify = NULL;
++	input_panel_surface_set_rail_visibility(ipsurf, false);
++	if (weston_surface_is_mapped(ipsurf->surface))
++		ipsurf->hide_idle = wl_event_loop_add_idle(
++			wl_display_get_event_loop(ipsurf->shell->compositor->wl_display),
++			hide_input_panel_surface_idle, ipsurf);
++
++	(void)data;
++}
++
++static void
++input_panel_surface_set_output(struct input_panel_surface *ipsurf,
++				       struct weston_output *output)
++{
++	if (ipsurf->output_destroy_listener.notify) {
++		wl_list_remove(&ipsurf->output_destroy_listener.link);
++		ipsurf->output_destroy_listener.notify = NULL;
++	}
++
++	ipsurf->output = output;
++	if (!output)
++		return;
++
++	ipsurf->output_destroy_listener.notify = input_panel_handle_output_destroy;
++	wl_signal_add(&output->destroy_signal,
++		      &ipsurf->output_destroy_listener);
++}
++
++static void
++position_input_panel_surface(struct input_panel_surface *ipsurf)
++{
++	struct desktop_shell *shell = ipsurf->shell;
++	struct weston_view *view;
++	float x, y;
++
++	if (ipsurf->panel) {
++		if (!shell->text_input.surface)
++			return;
++
++		view = get_default_view(shell->text_input.surface);
++		if (!view)
++			return;
++
++		weston_view_to_global_float(
++			view,
++			shell->text_input.cursor_rectangle.x2,
++			shell->text_input.cursor_rectangle.y2,
++			&x, &y);
++	} else {
++		if (!ipsurf->output)
++			return;
++
++		x = ipsurf->output->x +
++			(ipsurf->output->width - ipsurf->surface->width) / 2;
++		y = ipsurf->output->y + ipsurf->output->height -
++			ipsurf->surface->height;
++	}
++
++	weston_view_set_position(ipsurf->view, x, y);
++}
++
++static void
++show_input_panel_surface(struct input_panel_surface *ipsurf)
++{
++	struct desktop_shell *shell = ipsurf->shell;
++	struct weston_surface *owner;
++	const struct weston_rdprail_api *api = shell->rdprail_api;
++
++	owner = weston_surface_get_main_surface(shell->text_input.surface);
++	if (api->set_window_owner)
++		api->set_window_owner(ipsurf->surface, owner);
++	position_input_panel_surface(ipsurf);
++	weston_layer_entry_insert(&shell->input_panel_layer.view_list,
++				  &ipsurf->view->layer_link);
++	weston_view_geometry_dirty(ipsurf->view);
++	weston_view_update_transform(ipsurf->view);
++	ipsurf->surface->is_mapped = true;
++	ipsurf->view->is_mapped = true;
++	input_panel_surface_set_rail_visibility(ipsurf, true);
++	weston_surface_damage(ipsurf->surface);
++}
++
+ static void
+ show_input_panels(struct wl_listener *listener, void *data)
+ {
+-	struct weston_surface *surface = (struct weston_surface*)data;
+-
+-	/* Output who requested to show input panels */
+-	if (surface && surface->resource) {
+-		pid_t pid;
+-		uid_t uid;
+-		gid_t gid;
+-		struct wl_client *client = wl_resource_get_client(surface->resource);
+-		wl_client_get_credentials(client, &pid, &uid, &gid);
+-		weston_log("%s pid:%d, uid:%d, gid:%d is requesting to show input panel\n",
+-			    __func__, pid, uid, gid);
+-		if (pid > 0 && !is_system_distro()) {
+-			char path[32] = {};
+-			char image_name[256] = {};
+-			sprintf(path, "/proc/%d/exe", pid);
+-			if (readlink(path, image_name, sizeof image_name) > 0)
+-				weston_log("%s pid:%d, image_name:%s\n",__func__, pid, image_name);
++	struct desktop_shell *shell =
++		container_of(listener, struct desktop_shell,
++			     show_input_panel_listener);
++	struct input_panel_surface *ipsurf, *next;
++
++	input_panel_set_owner(shell, data);
++	if (shell->showing_input_panels)
++		return;
++
++	shell->showing_input_panels = true;
++	weston_layer_set_position(&shell->input_panel_layer,
++				  WESTON_LAYER_POSITION_TOP_UI);
++
++	wl_list_for_each_safe(ipsurf, next,
++			      &shell->input_panel.surfaces, link) {
++		if (ipsurf->surface->width == 0 ||
++		    (!ipsurf->panel && !ipsurf->output))
++			continue;
++
++		show_input_panel_surface(ipsurf);
++	}
++}
++
++static void
++hide_input_panels_now(struct desktop_shell *shell)
++{
++	struct input_panel_surface *ipsurf;
++
++	if (!shell->showing_input_panels)
++		return;
++
++	shell->showing_input_panels = false;
++	weston_layer_unset_position(&shell->input_panel_layer);
++
++	wl_list_for_each(ipsurf, &shell->input_panel.surfaces, link)
++		hide_input_panel_surface(ipsurf);
++}
++
++static void
++hide_input_panels(struct wl_listener *listener, void *data)
++{
++	struct desktop_shell *shell =
++		container_of(listener, struct desktop_shell,
++			     hide_input_panel_listener);
++
++	hide_input_panels_now(shell);
++	input_panel_set_owner(shell, NULL);
++
++	(void)data;
++}
++
++static void
++update_input_panels(struct wl_listener *listener, void *data)
++{
++	struct desktop_shell *shell =
++		container_of(listener, struct desktop_shell,
++			     update_input_panel_listener);
++	struct input_panel_surface *ipsurf;
++
++	memcpy(&shell->text_input.cursor_rectangle, data,
++	       sizeof shell->text_input.cursor_rectangle);
++
++	wl_list_for_each(ipsurf, &shell->input_panel.surfaces, link) {
++		if (ipsurf->panel && weston_surface_is_mapped(ipsurf->surface)) {
++			position_input_panel_surface(ipsurf);
++			weston_view_update_transform(ipsurf->view);
++			weston_surface_damage(ipsurf->surface);
+ 		}
+ 	}
+ }
+@@ -77,7 +298,20 @@ input_panel_get_label(struct weston_surface *surface, char *buf, size_t len)
+ static void
+ input_panel_committed(struct weston_surface *surface, int32_t sx, int32_t sy)
+ {
+-	weston_log("%s is not expected to be called\n", __func__);
++	struct input_panel_surface *ipsurf = surface->committed_private;
++
++	if (surface->width == 0)
++		return;
++	if (!ipsurf->panel && !ipsurf->output)
++		return;
++
++	position_input_panel_surface(ipsurf);
++	if (!weston_surface_is_mapped(surface) &&
++	    ipsurf->shell->showing_input_panels)
++		show_input_panel_surface(ipsurf);
++
++	(void)sx;
++	(void)sy;
+ }
+ 
+ static void
+@@ -85,11 +319,16 @@ destroy_input_panel_surface(struct input_panel_surface *input_panel_surface)
+ {
+ 	wl_signal_emit(&input_panel_surface->destroy_signal, input_panel_surface);
+ 
++	if (input_panel_surface->hide_idle)
++		wl_event_source_remove(input_panel_surface->hide_idle);
+ 	wl_list_remove(&input_panel_surface->surface_destroy_listener.link);
++	input_panel_surface_set_output(input_panel_surface, NULL);
++	wl_list_remove(&input_panel_surface->link);
+ 
+ 	input_panel_surface->surface->committed = NULL;
+ 	input_panel_surface->surface->committed_private = NULL;
+ 	weston_surface_set_label_func(input_panel_surface->surface, NULL);
++	weston_view_destroy(input_panel_surface->view);
+ 
+ 	free(input_panel_surface);
+ }
+@@ -118,17 +357,23 @@ create_input_panel_surface(struct desktop_shell *shell,
+ 	if (!input_panel_surface)
+ 		return NULL;
+ 
++	input_panel_surface->shell = shell;
++	input_panel_surface->surface = surface;
++	input_panel_surface->view = weston_view_create(surface);
++	if (!input_panel_surface->view) {
++		free(input_panel_surface);
++		return NULL;
++	}
++
+ 	surface->committed = input_panel_committed;
+ 	surface->committed_private = input_panel_surface;
+ 	weston_surface_set_label_func(surface, input_panel_get_label);
+ 
+-	input_panel_surface->shell = shell;
+-	input_panel_surface->surface = surface;
+-
+ 	wl_signal_init(&input_panel_surface->destroy_signal);
+ 	input_panel_surface->surface_destroy_listener.notify = input_panel_handle_surface_destroy;
+ 	wl_signal_add(&surface->destroy_signal,
+ 		      &input_panel_surface->surface_destroy_listener);
++	wl_list_init(&input_panel_surface->link);
+ 
+ 	return input_panel_surface;
+ }
+@@ -139,12 +384,52 @@ input_panel_surface_set_toplevel(struct wl_client *client,
+ 				 struct wl_resource *output_resource,
+ 				 uint32_t position)
+ {
++	struct input_panel_surface *ipsurf =
++		wl_resource_get_user_data(resource);
++	struct weston_head *head;
++
++	if (ipsurf->role_set) {
++		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
++				       "input panel surface role already set");
++		return;
++	}
++
++	head = weston_head_from_resource(output_resource);
++	if (!head || !head->output) {
++		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
++				       "input panel output is unavailable");
++		return;
++	}
++
++	wl_list_insert(&ipsurf->shell->input_panel.surfaces, &ipsurf->link);
++	input_panel_surface_set_output(ipsurf, head->output);
++	ipsurf->panel = 0;
++	ipsurf->role_set = true;
++	input_panel_surface_set_rail_visibility(ipsurf, false);
++
++	(void)client;
++	(void)position;
+ }
+ 
+ static void
+ input_panel_surface_set_overlay_panel(struct wl_client *client,
+ 				      struct wl_resource *resource)
+ {
++	struct input_panel_surface *ipsurf =
++		wl_resource_get_user_data(resource);
++
++	if (ipsurf->role_set) {
++		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
++				       "input panel surface role already set");
++		return;
++	}
++
++	wl_list_insert(&ipsurf->shell->input_panel.surfaces, &ipsurf->link);
++	ipsurf->panel = 1;
++	ipsurf->role_set = true;
++	input_panel_surface_set_rail_visibility(ipsurf, false);
++
++	(void)client;
+ }
+ 
+ static const struct zwp_input_panel_surface_v1_interface input_panel_surface_implementation = {
+@@ -245,7 +530,10 @@ bind_input_panel(struct wl_client *client,
+ void
+ input_panel_destroy(struct desktop_shell *shell)
+ {
++	input_panel_set_owner(shell, NULL);
+ 	wl_list_remove(&shell->show_input_panel_listener.link);
++	wl_list_remove(&shell->hide_input_panel_listener.link);
++	wl_list_remove(&shell->update_input_panel_listener.link);
+ }
+ 
+ int
+@@ -256,6 +544,14 @@ input_panel_setup(struct desktop_shell *shell)
+ 	shell->show_input_panel_listener.notify = show_input_panels;
+ 	wl_signal_add(&ec->show_input_panel_signal,
+ 		      &shell->show_input_panel_listener);
++	shell->hide_input_panel_listener.notify = hide_input_panels;
++	wl_signal_add(&ec->hide_input_panel_signal,
++		      &shell->hide_input_panel_listener);
++	shell->update_input_panel_listener.notify = update_input_panels;
++	wl_signal_add(&ec->update_input_panel_signal,
++		      &shell->update_input_panel_listener);
++
++	wl_list_init(&shell->input_panel.surfaces);
+ 
+ 	if (wl_global_create(shell->compositor->wl_display,
+ 			     &zwp_input_panel_v1_interface, 1,
+@@ -264,4 +560,3 @@ input_panel_setup(struct desktop_shell *shell)
+ 
+ 	return 0;
+ }
+-
+diff --git a/rdprail-shell/shell.c b/rdprail-shell/shell.c
+index 75fc8367..c8a351b6 100644
+--- a/rdprail-shell/shell.c
++++ b/rdprail-shell/shell.c
+@@ -4431,6 +4431,8 @@ shell_for_each_layer(struct desktop_shell *shell,
+ 
+ 	wl_array_for_each(ws, &shell->workspaces.array)
+ 		func(shell, &(*ws)->layer, data);
++
++	func(shell, &shell->input_panel_layer, data);
+ }
+ 
+ static void
+@@ -4983,6 +4985,7 @@ wet_shell_init(struct weston_compositor *ec,
+ 
+ 	weston_layer_set_position(&shell->fullscreen_layer,
+ 				  WESTON_LAYER_POSITION_FULLSCREEN);
++	weston_layer_init(&shell->input_panel_layer, ec);
+ 
+ 	wl_array_init(&shell->workspaces.array);
+ 	wl_list_init(&shell->workspaces.client_list);
+diff --git a/rdprail-shell/shell.h b/rdprail-shell/shell.h
+index 7df23c0d..a3b97869 100644
+--- a/rdprail-shell/shell.h
++++ b/rdprail-shell/shell.h
+@@ -80,8 +80,11 @@ struct desktop_shell {
+ 	struct wl_listener transform_listener;
+ 	struct wl_listener destroy_listener;
+ 	struct wl_listener show_input_panel_listener;
++	struct wl_listener hide_input_panel_listener;
++	struct wl_listener update_input_panel_listener;
+ 
+ 	struct weston_layer fullscreen_layer;
++	struct weston_layer input_panel_layer;
+ 
+ 	struct wl_listener pointer_focus_listener;
+ 	struct weston_surface *grab_surface;
+@@ -101,6 +104,7 @@ struct desktop_shell {
+ 
+ 	struct {
+ 		struct weston_surface *surface;
++		struct wl_listener surface_destroy_listener;
+ 		pixman_box32_t cursor_rectangle;
+ 	} text_input;
+ 
+@@ -114,7 +118,9 @@ struct desktop_shell {
+ 
+ 	struct {
+ 		struct wl_resource *binding;
++		struct wl_list surfaces;
+ 	} input_panel;
++	bool showing_input_panels;
+ 
+ 	bool allow_zap;
+ 	bool allow_alt_f4_to_close_app;
+diff --git a/tests/input-method-bind-test.c b/tests/input-method-bind-test.c
+new file mode 100644
+index 00000000..2d9fa180
+--- /dev/null
++++ b/tests/input-method-bind-test.c
+@@ -0,0 +1,120 @@
++/*
++ * Copyright 2026 huyuliang
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "config.h"
++
++#include <stdbool.h>
++#include <string.h>
++
++#include "input-method-unstable-v1-client-protocol.h"
++#include "test-config.h"
++#include "weston-test-client-helper.h"
++#include "weston-test-fixture-compositor.h"
++
++struct setup_args {
++	const char *config_file;
++	bool allow_external;
++};
++
++static const struct setup_args setup_args[] = {
++	{ TESTSUITE_INPUT_METHOD_DENY_CONFIG_PATH, false },
++	{ TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH, true },
++};
++
++static enum test_result_code
++fixture_setup(struct weston_test_harness *harness,
++	      const struct setup_args *args)
++{
++	struct compositor_setup setup;
++
++	compositor_setup_defaults(&setup);
++	setup.config_file = args->config_file;
++	setup.shell = SHELL_DESKTOP;
++
++	return weston_test_harness_execute_as_client(harness, &setup);
++}
++DECLARE_FIXTURE_SETUP_WITH_ARG(fixture_setup, setup_args);
++
++static struct zwp_input_method_v1 *
++bind_input_method(struct client *client)
++{
++	struct global *global;
++
++	wl_list_for_each(global, &client->global_list, link) {
++		if (strcmp(global->interface, "zwp_input_method_v1") == 0)
++			return wl_registry_bind(
++				client->wl_registry, global->name,
++				&zwp_input_method_v1_interface, 1);
++	}
++
++	return NULL;
++}
++
++static struct zwp_input_method_v1 *
++bind_input_method_successfully(struct client *client)
++{
++	struct zwp_input_method_v1 *input_method;
++
++	input_method = bind_input_method(client);
++	assert(input_method);
++	client_roundtrip(client);
++	assert(wl_display_get_error(client->wl_display) == 0);
++
++	return input_method;
++}
++
++TEST(input_method_external_bind)
++{
++	const struct setup_args *args;
++	struct zwp_input_method_v1 *input_method;
++	struct client *client;
++	struct client *other_client;
++
++	args = &setup_args[get_test_fixture_index()];
++	client = create_client();
++	input_method = bind_input_method(client);
++	assert(input_method);
++
++	if (!args->allow_external) {
++		expect_protocol_error(client, &zwp_input_method_v1_interface,
++				      WL_DISPLAY_ERROR_INVALID_OBJECT);
++		return;
++	}
++
++	client_roundtrip(client);
++	assert(wl_display_get_error(client->wl_display) == 0);
++	wl_proxy_destroy((struct wl_proxy *) input_method);
++	client_destroy(client);
++
++	client = create_client();
++	input_method = bind_input_method_successfully(client);
++
++	other_client = create_client();
++	assert(bind_input_method(other_client));
++	expect_protocol_error(other_client, &zwp_input_method_v1_interface,
++			      WL_DISPLAY_ERROR_INVALID_OBJECT);
++
++	wl_proxy_destroy((struct wl_proxy *) input_method);
++}
+diff --git a/tests/input-method-external-allow.ini b/tests/input-method-external-allow.ini
+new file mode 100644
+index 00000000..3a85b13d
+--- /dev/null
++++ b/tests/input-method-external-allow.ini
+@@ -0,0 +1,3 @@
++[input-method]
++path=
++allow-external=true
+diff --git a/tests/input-method-external-deny.ini b/tests/input-method-external-deny.ini
+new file mode 100644
+index 00000000..88327b56
+--- /dev/null
++++ b/tests/input-method-external-deny.ini
+@@ -0,0 +1,2 @@
++[input-method]
++path=
+diff --git a/tests/meson.build b/tests/meson.build
+index d52a8716..9bef3e4e 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -2,7 +2,11 @@ plugin_test_shell_desktop = shared_library(
+ 	'weston-test-desktop-shell',
+ 	'weston-test-desktop-shell.c',
+ 	include_directories: common_inc,
+-	dependencies: [ dep_lib_desktop, dep_libweston_public ],
++	dependencies: [
++		dep_lib_desktop,
++		dep_libexec_weston,
++		dep_libweston_public,
++	],
+ 	name_prefix: '',
+ 	install: false
+ )
+@@ -71,6 +75,24 @@ exe_plugin_test = shared_library(
+ 	install: false,
+ )
+ 
++if get_option('backend-rdp') and get_option('shell-rdprail')
++	plugin_rdprail_test = shared_library(
++		'rdprail-test',
++		[
++			'rdprail-test.c',
++			weston_rdprail_test_server_protocol_h,
++			weston_rdprail_test_protocol_c,
++		],
++		include_directories: common_inc,
++		dependencies: [
++			dep_frdp,
++			dep_libweston_private,
++		],
++		name_prefix: '',
++		install: false,
++	)
++endif
++
+ deps_zuc = [ dep_libshared ]
+ if get_option('test-junit-xml')
+ 	d = dependency('libxml-2.0', version: '>= 2.6', required: false)
+@@ -116,12 +138,42 @@ dep_zucmain = declare_dependency(
+ 	dependencies: dep_zuc
+ )
+ 
++exe_text_input_method_test = executable(
++	'text-input-method-test',
++	[
++		'text-input-method-test.c',
++		input_method_unstable_v1_client_protocol_h,
++		input_method_unstable_v1_protocol_c,
++	],
++	include_directories: common_inc,
++	dependencies: dep_wayland_client,
++	install: false,
++)
++
++text_test_config = configuration_data()
++text_test_config.set(
++	'TEST_INPUT_METHOD_PATH', exe_text_input_method_test.full_path()
++)
++configure_file(
++	input: 'text-test.ini.in',
++	output: 'text-test.ini',
++	configuration: text_test_config,
++)
++
+ tests = [
+ 	{	'name': 'bad-buffer', },
+ 	{	'name': 'drm-smoke', },
+ 	{	'name': 'buffer-transforms', },
+ 	{	'name': 'devices', },
+ 	{	'name': 'event', },
++	{
++		'name': 'input-method-bind',
++		'sources': [
++			'input-method-bind-test.c',
++			input_method_unstable_v1_client_protocol_h,
++			input_method_unstable_v1_protocol_c,
++		],
++	},
+ 	{	'name': 'internal-screenshot', },
+ 	{
+ 		'name': 'keyboard',
+@@ -171,7 +223,10 @@ tests = [
+ 			'text-test.c',
+ 			text_input_unstable_v1_client_protocol_h,
+ 			text_input_unstable_v1_protocol_c,
++			text_input_unstable_v3_client_protocol_h,
++			text_input_unstable_v3_protocol_c,
+ 		],
++		'test_deps': [ exe_text_input_method_test ],
+ 	},
+ 	{
+ 		'name': 'touch',
+@@ -190,6 +245,23 @@ tests = [
+ 	{	'name': 'viewporter-shot', },
+ ]
+ 
++if get_option('backend-rdp') and get_option('shell-rdprail')
++	tests += {
++		'name': 'rdprail-input-panel',
++		'sources': [
++			'rdprail-input-panel-test.c',
++			input_method_unstable_v1_client_protocol_h,
++			input_method_unstable_v1_protocol_c,
++			text_input_unstable_v1_client_protocol_h,
++			text_input_unstable_v1_protocol_c,
++			weston_rdprail_test_client_protocol_h,
++			weston_rdprail_test_protocol_c,
++		],
++		'dep_objs': dep_frdp,
++		'test_deps': [ plugin_rdprail_test ],
++	}
++endif
++
+ tests_standalone = [
+ 	['config-parser', [], [ dep_zucmain ]],
+ 	['matrix', [], [ dep_libm, dep_matrix_c ]],
+@@ -203,6 +275,18 @@ tests_standalone = [
+ 	],
+ ]
+ 
++if get_option('backend-rdp')
++	tests_standalone += [
++		[
++			'rdprail-window-state',
++			[
++				'../libweston/backend-rdp/rdprail-window-state.c',
++			],
++			[ dep_zucmain, dep_frdp, dep_libweston_public ],
++		],
++	]
++endif
++
+ if get_option('backend-rdp')
+ 	tests_standalone += [[
+ 		'rdp-teardown',
+@@ -213,6 +297,7 @@ if get_option('backend-rdp')
+ 			'rdpdisp.c',
+ 			'rdpclip.c',
+ 			'rdprail.c',
++			'rdprail-window-state.c',
+ 			'rdputil.c',
+ 		),
+ 	]]
+@@ -283,6 +368,28 @@ test_config_h.set_quoted('WESTON_DATA_DIR', join_paths(meson.current_source_dir(
+ test_config_h.set_quoted('TESTSUITE_PLUGIN_PATH', exe_plugin_test.full_path())
+ test_config_h.set_quoted('TESTSUITE_IVI_CONFIG_PATH', join_paths(meson.current_build_dir(), '../ivi-shell/weston-ivi-test.ini'))
+ test_config_h.set_quoted('TESTSUITE_INTERNAL_SCREENSHOT_CONFIG_PATH', join_paths(meson.current_source_dir(), 'internal-screenshot.ini'))
++test_config_h.set_quoted(
++	'TESTSUITE_TEXT_CONFIG_PATH',
++	join_paths(meson.current_build_dir(), 'text-test.ini')
++)
++if get_option('backend-rdp') and get_option('shell-rdprail')
++	test_config_h.set_quoted(
++		'TESTSUITE_RDPRAIL_INPUT_PANEL_CONFIG_PATH',
++		join_paths(meson.current_source_dir(), 'rdprail-input-panel.ini')
++	)
++	test_config_h.set_quoted(
++		'TESTSUITE_RDPRAIL_TEST_PLUGIN_PATH',
++		plugin_rdprail_test.full_path()
++	)
++endif
++test_config_h.set_quoted(
++	'TESTSUITE_INPUT_METHOD_DENY_CONFIG_PATH',
++	join_paths(meson.current_source_dir(), 'input-method-external-deny.ini')
++)
++test_config_h.set_quoted(
++	'TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH',
++	join_paths(meson.current_source_dir(), 'input-method-external-allow.ini')
++)
+ configure_file(output: 'test-config.h', configuration: test_config_h)
+ 
+ foreach t : tests
+diff --git a/tests/rdprail-input-panel-test.c b/tests/rdprail-input-panel-test.c
+new file mode 100644
+index 00000000..2d10eec7
+--- /dev/null
++++ b/tests/rdprail-input-panel-test.c
+@@ -0,0 +1,611 @@
++/*
++ * Copyright 2026 Microsoft Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "config.h"
++
++#include <assert.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <libweston/backend-rdp.h>
++
++#include "input-method-unstable-v1-client-protocol.h"
++#include "test-config.h"
++#include "text-input-unstable-v1-client-protocol.h"
++#include "weston-rdprail-test-client-protocol.h"
++#include "weston-test-client-helper.h"
++#include "weston-test-fixture-compositor.h"
++
++static enum test_result_code
++fixture_setup(struct weston_test_harness *harness)
++{
++	struct compositor_setup setup;
++
++	compositor_setup_defaults(&setup);
++	setup.backend = WESTON_BACKEND_RDP;
++	setup.shell = SHELL_RDPRAIL;
++	setup.config_file = TESTSUITE_RDPRAIL_INPUT_PANEL_CONFIG_PATH;
++	setup.extra_module = TESTSUITE_RDPRAIL_TEST_PLUGIN_PATH;
++
++	return weston_test_harness_execute_as_client(harness, &setup);
++}
++DECLARE_FIXTURE_SETUP(fixture_setup);
++
++struct input_method_state {
++	struct zwp_input_method_context_v1 *context;
++};
++
++struct rdprail_test_state {
++	bool received;
++	bool owner_matches;
++	uint32_t show_state_requested;
++};
++
++static void
++rdprail_window_state(void *data, struct weston_rdprail_test *rdprail_test,
++		     uint32_t owner_matches,
++		     uint32_t show_state_requested)
++{
++	struct rdprail_test_state *state = data;
++
++	state->received = true;
++	state->owner_matches = owner_matches;
++	state->show_state_requested = show_state_requested;
++
++	(void)rdprail_test;
++}
++
++static const struct weston_rdprail_test_listener rdprail_test_listener = {
++	rdprail_window_state,
++};
++
++static void
++context_surrounding_text(void *data,
++			 struct zwp_input_method_context_v1 *context,
++			 const char *text, uint32_t cursor, uint32_t anchor)
++{
++}
++
++static void
++context_reset(void *data, struct zwp_input_method_context_v1 *context)
++{
++}
++
++static void
++context_content_type(void *data,
++		     struct zwp_input_method_context_v1 *context,
++		     uint32_t hint, uint32_t purpose)
++{
++}
++
++static void
++context_invoke_action(void *data,
++		      struct zwp_input_method_context_v1 *context,
++		      uint32_t button, uint32_t index)
++{
++}
++
++static void
++context_commit_state(void *data,
++		     struct zwp_input_method_context_v1 *context,
++		     uint32_t serial)
++{
++}
++
++static void
++context_preferred_language(void *data,
++			   struct zwp_input_method_context_v1 *context,
++			   const char *language)
++{
++}
++
++static const struct zwp_input_method_context_v1_listener context_listener = {
++	context_surrounding_text,
++	context_reset,
++	context_content_type,
++	context_invoke_action,
++	context_commit_state,
++	context_preferred_language,
++};
++
++static void
++input_method_activate(void *data,
++		      struct zwp_input_method_v1 *input_method,
++		      struct zwp_input_method_context_v1 *context)
++{
++	struct input_method_state *state = data;
++
++	state->context = context;
++	zwp_input_method_context_v1_add_listener(context, &context_listener,
++					 state);
++
++	(void)input_method;
++}
++
++static void
++input_method_deactivate(void *data,
++			struct zwp_input_method_v1 *input_method,
++			struct zwp_input_method_context_v1 *context)
++{
++	struct input_method_state *state = data;
++
++	if (state->context == context)
++		state->context = NULL;
++	zwp_input_method_context_v1_destroy(context);
++
++	(void)input_method;
++}
++
++static const struct zwp_input_method_v1_listener input_method_listener = {
++	input_method_activate,
++	input_method_deactivate,
++};
++
++static void
++text_input_commit_string(void *data, struct zwp_text_input_v1 *text_input,
++			 uint32_t serial, const char *text)
++{
++}
++
++static void
++text_input_preedit_string(void *data, struct zwp_text_input_v1 *text_input,
++			  uint32_t serial, const char *text, const char *commit)
++{
++}
++
++static void
++text_input_delete_surrounding_text(void *data,
++				   struct zwp_text_input_v1 *text_input,
++				   int32_t index, uint32_t length)
++{
++}
++
++static void
++text_input_cursor_position(void *data, struct zwp_text_input_v1 *text_input,
++			   int32_t index, int32_t anchor)
++{
++}
++
++static void
++text_input_preedit_styling(void *data, struct zwp_text_input_v1 *text_input,
++			   uint32_t index, uint32_t length, uint32_t style)
++{
++}
++
++static void
++text_input_preedit_cursor(void *data, struct zwp_text_input_v1 *text_input,
++			  int32_t index)
++{
++}
++
++static void
++text_input_modifiers_map(void *data, struct zwp_text_input_v1 *text_input,
++			 struct wl_array *map)
++{
++}
++
++static void
++text_input_keysym(void *data, struct zwp_text_input_v1 *text_input,
++		  uint32_t serial, uint32_t time, uint32_t sym,
++		  uint32_t state, uint32_t modifiers)
++{
++}
++
++static void
++text_input_enter(void *data, struct zwp_text_input_v1 *text_input,
++		 struct wl_surface *surface)
++{
++}
++
++static void
++text_input_leave(void *data, struct zwp_text_input_v1 *text_input)
++{
++}
++
++static void
++text_input_input_panel_state(void *data,
++			     struct zwp_text_input_v1 *text_input,
++			     uint32_t state)
++{
++}
++
++static void
++text_input_language(void *data, struct zwp_text_input_v1 *text_input,
++		    uint32_t serial, const char *language)
++{
++}
++
++static void
++text_input_text_direction(void *data, struct zwp_text_input_v1 *text_input,
++			  uint32_t serial, uint32_t direction)
++{
++}
++
++static const struct zwp_text_input_v1_listener text_input_listener = {
++	text_input_enter,
++	text_input_leave,
++	text_input_modifiers_map,
++	text_input_input_panel_state,
++	text_input_preedit_string,
++	text_input_preedit_styling,
++	text_input_preedit_cursor,
++	text_input_commit_string,
++	text_input_cursor_position,
++	text_input_delete_surrounding_text,
++	text_input_keysym,
++	text_input_language,
++	text_input_text_direction,
++};
++
++static struct global *
++find_global(struct client *client, const char *interface)
++{
++	struct global *global;
++
++	wl_list_for_each(global, &client->global_list, link) {
++		if (strcmp(global->interface, interface) == 0)
++			return global;
++	}
++
++	return NULL;
++}
++
++static struct zwp_input_panel_v1 *
++bind_input_panel(struct client *client)
++{
++	struct global *global;
++
++	global = find_global(client, "zwp_input_panel_v1");
++	assert(global);
++	return wl_registry_bind(client->wl_registry, global->name,
++				&zwp_input_panel_v1_interface, 1);
++}
++
++static struct zwp_input_method_v1 *
++bind_input_method(struct client *client, struct input_method_state *state)
++{
++	struct global *global;
++	struct zwp_input_method_v1 *input_method;
++
++	global = find_global(client, "zwp_input_method_v1");
++	assert(global);
++	input_method = wl_registry_bind(client->wl_registry, global->name,
++					&zwp_input_method_v1_interface, 1);
++	zwp_input_method_v1_add_listener(input_method, &input_method_listener,
++					 state);
++	return input_method;
++}
++
++static struct zwp_text_input_manager_v1 *
++bind_text_input_manager(struct client *client)
++{
++	struct global *global;
++
++	global = find_global(client, "zwp_text_input_manager_v1");
++	assert(global);
++	return wl_registry_bind(client->wl_registry, global->name,
++				&zwp_text_input_manager_v1_interface, 1);
++}
++
++static struct weston_rdprail_test *
++bind_rdprail_test(struct client *client, struct rdprail_test_state *state)
++{
++	struct global *global;
++	struct weston_rdprail_test *rdprail_test;
++
++	global = find_global(client, "weston_rdprail_test");
++	assert(global);
++	rdprail_test = wl_registry_bind(client->wl_registry, global->name,
++					&weston_rdprail_test_interface, 1);
++	weston_rdprail_test_add_listener(rdprail_test, &rdprail_test_listener,
++					 state);
++	return rdprail_test;
++}
++
++static void
++get_rdprail_window_state(struct client *client,
++			 struct weston_rdprail_test *rdprail_test,
++			 struct rdprail_test_state *state,
++			 struct wl_surface *surface,
++			 struct wl_surface *owner)
++{
++	state->received = false;
++	weston_rdprail_test_get_window_state(rdprail_test, surface, owner);
++	client_roundtrip(client);
++	assert(state->received);
++}
++
++static void
++set_output_mode(struct client *client)
++{
++	weston_test_set_output_mode(client->test->weston_test,
++				    client->output->wl_output, 320, 240);
++	client_roundtrip(client);
++	assert(client->output->width == 320);
++	assert(client->output->height == 240);
++}
++
++static void
++setup_client_surface(struct client *client, int x, int y)
++{
++	client->surface = create_test_surface(client);
++	client->surface->width = 20;
++	client->surface->height = 20;
++	client->surface->buffer = create_shm_buffer_a8r8g8b8(client, 20, 20);
++	weston_test_move_surface(client->test->weston_test,
++				 client->surface->wl_surface, x, y);
++	wl_surface_attach(client->surface->wl_surface,
++			  client->surface->buffer->proxy, 0, 0);
++	wl_surface_damage(client->surface->wl_surface, 0, 0, 20, 20);
++	wl_surface_commit(client->surface->wl_surface);
++	client_roundtrip(client);
++}
++
++static struct zwp_input_panel_surface_v1 *
++create_overlay_panel(struct client *client,
++			     struct zwp_input_panel_v1 *input_panel,
++			     struct wl_surface **surface_out,
++			     struct buffer **buffer_out)
++{
++	struct wl_surface *surface;
++	struct zwp_input_panel_surface_v1 *panel_surface;
++	struct buffer *buffer;
++	pixman_color_t color;
++
++	surface = wl_compositor_create_surface(client->wl_compositor);
++	assert(surface);
++	panel_surface = zwp_input_panel_v1_get_input_panel_surface(input_panel,
++							      surface);
++	zwp_input_panel_surface_v1_set_overlay_panel(panel_surface);
++
++	buffer = create_shm_buffer_a8r8g8b8(client, 8, 8);
++	color_rgb888(&color, 255, 0, 0);
++	fill_image_with_color(buffer->image, &color);
++	wl_surface_attach(surface, buffer->proxy, 0, 0);
++	wl_surface_damage(surface, 0, 0, 8, 8);
++	wl_surface_commit(surface);
++
++	*surface_out = surface;
++	*buffer_out = buffer;
++	return panel_surface;
++}
++
++static void
++check_repeated_role(void)
++{
++	struct client *client;
++	struct zwp_input_panel_v1 *input_panel;
++	struct wl_surface *surface;
++	struct zwp_input_panel_surface_v1 *panel_surface;
++
++	client = create_client();
++	input_panel = bind_input_panel(client);
++	surface = wl_compositor_create_surface(client->wl_compositor);
++	panel_surface = zwp_input_panel_v1_get_input_panel_surface(input_panel,
++							      surface);
++	zwp_input_panel_surface_v1_set_overlay_panel(panel_surface);
++	zwp_input_panel_surface_v1_set_overlay_panel(panel_surface);
++	expect_protocol_error(client, &zwp_input_panel_surface_v1_interface,
++			      WL_DISPLAY_ERROR_INVALID_OBJECT);
++}
++
++static void
++check_mixed_roles(void)
++{
++	struct client *client;
++	struct zwp_input_panel_v1 *input_panel;
++	struct wl_surface *surface;
++	struct zwp_input_panel_surface_v1 *panel_surface;
++
++	client = create_client();
++	input_panel = bind_input_panel(client);
++	surface = wl_compositor_create_surface(client->wl_compositor);
++	panel_surface = zwp_input_panel_v1_get_input_panel_surface(input_panel,
++							      surface);
++	zwp_input_panel_surface_v1_set_toplevel(panel_surface,
++						 client->output->wl_output,
++						 ZWP_INPUT_PANEL_SURFACE_V1_POSITION_CENTER_BOTTOM);
++	zwp_input_panel_surface_v1_set_overlay_panel(panel_surface);
++	expect_protocol_error(client, &zwp_input_panel_surface_v1_interface,
++			      WL_DISPLAY_ERROR_INVALID_OBJECT);
++}
++
++static void
++check_position_and_hide(void)
++{
++	struct client *client;
++	struct input_method_state input_method_state = {};
++	struct zwp_input_method_v1 *input_method;
++	struct zwp_input_panel_v1 *input_panel;
++	struct zwp_input_panel_surface_v1 *panel_surface;
++	struct zwp_text_input_manager_v1 *text_input_manager;
++	struct zwp_text_input_v1 *text_input;
++	struct weston_rdprail_test *rdprail_test;
++	struct rdprail_test_state rdprail_state = {};
++	struct wl_surface *panel;
++	struct buffer *panel_buffer;
++	struct weston_test_surface_state state;
++	bool owner_matches;
++	uint32_t show_state_requested;
++
++	client = create_client();
++	set_output_mode(client);
++	setup_client_surface(client, 100, 50);
++	input_method = bind_input_method(client, &input_method_state);
++	input_panel = bind_input_panel(client);
++	rdprail_test = bind_rdprail_test(client, &rdprail_state);
++	panel_surface = create_overlay_panel(client, input_panel, &panel,
++					     &panel_buffer);
++	text_input_manager = bind_text_input_manager(client);
++	text_input = zwp_text_input_manager_v1_create_text_input(text_input_manager);
++	zwp_text_input_v1_add_listener(text_input, &text_input_listener, client);
++
++	weston_test_activate_surface(client->test->weston_test,
++				     client->surface->wl_surface);
++	zwp_text_input_v1_activate(text_input, client->input->wl_seat,
++				   client->surface->wl_surface);
++	zwp_text_input_v1_set_cursor_rectangle(text_input, 7, 11, 1, 1);
++	zwp_text_input_v1_show_input_panel(text_input);
++	client_roundtrip(client);
++	assert(input_method_state.context);
++
++	state = get_surface_state(client, panel);
++	assert(state.mapped);
++	assert(wl_fixed_to_int(state.x) == 108);
++	assert(wl_fixed_to_int(state.y) == 62);
++	get_rdprail_window_state(client, rdprail_test, &rdprail_state, panel,
++				 client->surface->wl_surface);
++	owner_matches = rdprail_state.owner_matches;
++	show_state_requested = rdprail_state.show_state_requested;
++	assert(owner_matches);
++	assert(show_state_requested == RDP_WINDOW_SHOW);
++
++	zwp_text_input_v1_hide_input_panel(text_input);
++	client_roundtrip(client);
++	state = get_surface_state(client, panel);
++	assert(!state.mapped);
++	get_rdprail_window_state(client, rdprail_test, &rdprail_state, panel,
++				 client->surface->wl_surface);
++	owner_matches = rdprail_state.owner_matches;
++	show_state_requested = rdprail_state.show_state_requested;
++	assert(owner_matches);
++	assert(show_state_requested == RDP_WINDOW_HIDE);
++
++	zwp_text_input_v1_show_input_panel(text_input);
++	client_roundtrip(client);
++	state = get_surface_state(client, panel);
++	assert(state.mapped);
++
++	surface_destroy(client->surface);
++	client->surface = NULL;
++	client_roundtrip(client);
++	state = get_surface_state(client, panel);
++	assert(!state.mapped);
++	wl_surface_commit(panel);
++	client_roundtrip(client);
++	state = get_surface_state(client, panel);
++	assert(!state.mapped);
++
++	zwp_text_input_v1_destroy(text_input);
++	zwp_text_input_manager_v1_destroy(text_input_manager);
++	weston_rdprail_test_destroy(rdprail_test);
++	wl_surface_destroy(panel);
++	wl_proxy_destroy((struct wl_proxy *) panel_surface);
++	wl_proxy_destroy((struct wl_proxy *) input_panel);
++	wl_proxy_destroy((struct wl_proxy *) input_method);
++	buffer_destroy(panel_buffer);
++	client_destroy(client);
++}
++
++static void
++check_surface_destroy(void)
++{
++	struct client *client;
++	struct zwp_input_panel_v1 *input_panel;
++	struct zwp_input_panel_surface_v1 *panel_surface;
++	struct wl_surface *panel;
++	struct buffer *panel_buffer;
++
++	client = create_client();
++	input_panel = bind_input_panel(client);
++	panel_surface = create_overlay_panel(client, input_panel, &panel,
++					     &panel_buffer);
++	wl_surface_destroy(panel);
++	client_roundtrip(client);
++
++	wl_proxy_destroy((struct wl_proxy *) panel_surface);
++	wl_proxy_destroy((struct wl_proxy *) input_panel);
++	buffer_destroy(panel_buffer);
++	client_destroy(client);
++}
++
++static void
++check_output_destroy(void)
++{
++	struct client *client;
++	struct input_method_state input_method_state = {};
++	struct zwp_input_method_v1 *input_method;
++	struct zwp_input_panel_v1 *input_panel;
++	struct zwp_input_panel_surface_v1 *panel_surface;
++	struct zwp_text_input_manager_v1 *text_input_manager;
++	struct zwp_text_input_v1 *text_input;
++	struct wl_surface *panel;
++	struct buffer *buffer;
++	struct weston_test_surface_state state;
++
++	client = create_client();
++	setup_client_surface(client, 0, 0);
++	input_method = bind_input_method(client, &input_method_state);
++	input_panel = bind_input_panel(client);
++	panel = wl_compositor_create_surface(client->wl_compositor);
++	panel_surface = zwp_input_panel_v1_get_input_panel_surface(input_panel,
++							      panel);
++	zwp_input_panel_surface_v1_set_toplevel(panel_surface,
++						 client->output->wl_output,
++						 ZWP_INPUT_PANEL_SURFACE_V1_POSITION_CENTER_BOTTOM);
++	buffer = create_shm_buffer_a8r8g8b8(client, 8, 8);
++	wl_surface_attach(panel, buffer->proxy, 0, 0);
++	wl_surface_damage(panel, 0, 0, 8, 8);
++	wl_surface_commit(panel);
++	text_input_manager = bind_text_input_manager(client);
++	text_input = zwp_text_input_manager_v1_create_text_input(text_input_manager);
++	zwp_text_input_v1_add_listener(text_input, &text_input_listener, client);
++	weston_test_activate_surface(client->test->weston_test,
++				     client->surface->wl_surface);
++	zwp_text_input_v1_activate(text_input, client->input->wl_seat,
++				   client->surface->wl_surface);
++	zwp_text_input_v1_show_input_panel(text_input);
++	client_roundtrip(client);
++	assert(input_method_state.context);
++	state = get_surface_state(client, panel);
++	assert(state.mapped);
++
++	weston_test_destroy_output(client->test->weston_test,
++				  client->output->wl_output);
++	client_roundtrip(client);
++	state = get_surface_state(client, panel);
++	assert(!state.mapped);
++	wl_surface_commit(panel);
++	client_roundtrip(client);
++	state = get_surface_state(client, panel);
++	assert(!state.mapped);
++
++	zwp_text_input_v1_destroy(text_input);
++	zwp_text_input_manager_v1_destroy(text_input_manager);
++	wl_surface_destroy(panel);
++	wl_proxy_destroy((struct wl_proxy *) panel_surface);
++	wl_proxy_destroy((struct wl_proxy *) input_panel);
++	wl_proxy_destroy((struct wl_proxy *) input_method);
++	buffer_destroy(buffer);
++	client_destroy(client);
++}
++
++TEST(input_panel)
++{
++	check_repeated_role();
++	check_mixed_roles();
++	check_position_and_hide();
++	check_surface_destroy();
++	check_output_destroy();
++}
+diff --git a/tests/rdprail-input-panel.ini b/tests/rdprail-input-panel.ini
+new file mode 100644
+index 00000000..3a85b13d
+--- /dev/null
++++ b/tests/rdprail-input-panel.ini
+@@ -0,0 +1,3 @@
++[input-method]
++path=
++allow-external=true
+diff --git a/tests/rdprail-test.c b/tests/rdprail-test.c
+new file mode 100644
+index 00000000..4d303c41
+--- /dev/null
++++ b/tests/rdprail-test.c
+@@ -0,0 +1,107 @@
++/*
++ * Copyright 2026 Microsoft Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "config.h"
++
++#include <stdint.h>
++
++#include <libweston/backend-rdp.h>
++#include <libweston/libweston.h>
++
++#include "compositor/weston.h"
++#include "weston-rdprail-test-server-protocol.h"
++
++static void
++get_window_state(struct wl_client *client, struct wl_resource *resource,
++		 struct wl_resource *surface_resource,
++		 struct wl_resource *owner_resource)
++{
++	struct weston_surface *surface =
++		wl_resource_get_user_data(surface_resource);
++	struct weston_surface *owner = owner_resource ?
++		wl_resource_get_user_data(owner_resource) : NULL;
++	struct weston_surface_rail_state *rail_state;
++	uint32_t owner_matches = 0;
++	uint32_t show_state_requested = RDP_WINDOW_HIDE;
++
++	if (!surface) {
++		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
++				       "surface is unavailable");
++		return;
++	}
++
++	rail_state = surface->backend_state;
++	if (rail_state) {
++		owner_matches = rail_state->parent_surface == owner;
++		show_state_requested = rail_state->showState_requested;
++	}
++
++	weston_rdprail_test_send_window_state(resource, owner_matches,
++					      show_state_requested);
++
++	(void)client;
++}
++
++static const struct weston_rdprail_test_interface test_implementation = {
++	get_window_state,
++};
++
++static void
++bind_rdprail_test(struct wl_client *client, void *data,
++		  uint32_t version, uint32_t id)
++{
++	struct wl_resource *resource;
++
++	resource = wl_resource_create(client, &weston_rdprail_test_interface,
++				      1, id);
++	if (!resource) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++
++	wl_resource_set_implementation(resource, &test_implementation,
++				       data, NULL);
++
++	(void)version;
++}
++
++WL_EXPORT int
++wet_module_init(struct weston_compositor *compositor,
++		int *argc, char *argv[])
++{
++	if (!weston_rdprail_get_api(compositor)) {
++		weston_log("RDPRAIL test requires the RDP backend.\n");
++		return -1;
++	}
++
++	if (!wl_global_create(compositor->wl_display,
++			      &weston_rdprail_test_interface, 1,
++			      compositor, bind_rdprail_test))
++		return -1;
++
++	(void)argc;
++	(void)argv;
++
++	return 0;
++}
+diff --git a/tests/rdprail-window-state-test.c b/tests/rdprail-window-state-test.c
+new file mode 100644
+index 00000000..cededbc2
+--- /dev/null
++++ b/tests/rdprail-window-state-test.c
+@@ -0,0 +1,172 @@
++/*
++ * Copyright 2026 Microsoft Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "config.h"
++
++#include <libweston/backend-rdp.h>
++
++#include "libweston/backend-rdp/rdprail-window-state.h"
++#include "shared/helpers.h"
++#include "zunitc/zunitc.h"
++
++struct dispatch_state {
++	unsigned int count;
++	unsigned int calls[3];
++	WINDOW_ORDER_INFO order_info;
++	WINDOW_STATE_ORDER window_state;
++};
++
++static BOOL
++record_begin_paint(rdpContext *context)
++{
++	struct dispatch_state *state = (struct dispatch_state *)context;
++
++	state->calls[state->count++] = 1;
++	return TRUE;
++}
++
++static BOOL
++record_window_update(rdpContext *context,
++		     const WINDOW_ORDER_INFO *order_info,
++		     const WINDOW_STATE_ORDER *window_state)
++{
++	struct dispatch_state *state = (struct dispatch_state *)context;
++
++	state->calls[state->count++] = 2;
++	state->order_info = *order_info;
++	state->window_state = *window_state;
++	return TRUE;
++}
++
++static BOOL
++record_end_paint(rdpContext *context)
++{
++	struct dispatch_state *state = (struct dispatch_state *)context;
++
++	state->calls[state->count++] = 3;
++	return TRUE;
++}
++
++ZUC_TEST(rdprail_window_state_test, leaves_unchanged_state_alone)
++{
++	WINDOW_ORDER_INFO order_info = {
++		.fieldFlags = WINDOW_ORDER_TYPE_WINDOW,
++	};
++	WINDOW_STATE_ORDER window_state = {};
++	uint32_t fields;
++
++	fields = rdp_rail_prepare_window_state_order(
++		10, 10, RDP_WINDOW_SHOW, RDP_WINDOW_SHOW,
++		&order_info, &window_state);
++
++	ZUC_ASSERT_EQ(0, fields);
++	ZUC_ASSERT_EQ(WINDOW_ORDER_TYPE_WINDOW, order_info.fieldFlags);
++}
++
++ZUC_TEST(rdprail_window_state_test, writes_owner_and_show_fields)
++{
++	WINDOW_ORDER_INFO order_info = {
++		.fieldFlags = WINDOW_ORDER_TYPE_WINDOW,
++	};
++	WINDOW_STATE_ORDER window_state = {};
++	uint32_t fields;
++
++	fields = rdp_rail_prepare_window_state_order(
++		10, 20, RDP_WINDOW_HIDE, RDP_WINDOW_SHOW,
++		&order_info, &window_state);
++
++	ZUC_ASSERT_EQ(WINDOW_ORDER_FIELD_OWNER | WINDOW_ORDER_FIELD_SHOW,
++		      fields);
++	ZUC_ASSERT_EQ(WINDOW_ORDER_TYPE_WINDOW | WINDOW_ORDER_FIELD_OWNER |
++		      WINDOW_ORDER_FIELD_SHOW, order_info.fieldFlags);
++	ZUC_ASSERT_EQ(20, window_state.ownerWindowId);
++	ZUC_ASSERT_EQ(WINDOW_SHOW, window_state.showState);
++}
++
++ZUC_TEST(rdprail_window_state_test, maps_all_show_states)
++{
++	static const struct {
++		uint32_t requested;
++		uint32_t expected;
++	} cases[] = {
++		{ RDP_WINDOW_HIDE, WINDOW_HIDE },
++		{ RDP_WINDOW_SHOW, WINDOW_SHOW },
++		{ RDP_WINDOW_SHOW_MINIMIZED, WINDOW_SHOW_MINIMIZED },
++		{ RDP_WINDOW_SHOW_MAXIMIZED, WINDOW_SHOW_MAXIMIZED },
++		{ RDP_WINDOW_SHOW_FULLSCREEN, WINDOW_SHOW },
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_LENGTH(cases); i++) {
++		WINDOW_ORDER_INFO order_info = {};
++		WINDOW_STATE_ORDER window_state = {};
++		uint32_t previous;
++		uint32_t fields;
++
++		previous = cases[i].requested == RDP_WINDOW_HIDE ?
++			RDP_WINDOW_SHOW : RDP_WINDOW_HIDE;
++		fields = rdp_rail_prepare_window_state_order(
++			0, 0, previous, cases[i].requested,
++			&order_info, &window_state);
++
++		ZUC_ASSERT_EQ(WINDOW_ORDER_FIELD_SHOW, fields);
++		ZUC_ASSERT_EQ(cases[i].expected, window_state.showState);
++	}
++}
++
++ZUC_TEST(rdprail_window_state_test, dispatches_window_update_order)
++{
++	struct dispatch_state state = {};
++	rdpWindowUpdate window_update = {
++		.WindowUpdate = record_window_update,
++	};
++	rdpUpdate update = {
++		.context = (rdpContext *)&state,
++		.BeginPaint = record_begin_paint,
++		.EndPaint = record_end_paint,
++		.window = &window_update,
++	};
++	WINDOW_ORDER_INFO order_info = {
++		.windowId = 10,
++		.fieldFlags = WINDOW_ORDER_TYPE_WINDOW |
++			      WINDOW_ORDER_FIELD_OWNER |
++			      WINDOW_ORDER_FIELD_SHOW,
++	};
++	WINDOW_STATE_ORDER window_state = {
++		.ownerWindowId = 20,
++		.showState = WINDOW_SHOW,
++	};
++
++	rdp_rail_send_window_state_order(&update, &order_info, &window_state);
++
++	ZUC_ASSERT_EQ(3, state.count);
++	ZUC_ASSERT_EQ(1, state.calls[0]);
++	ZUC_ASSERT_EQ(2, state.calls[1]);
++	ZUC_ASSERT_EQ(3, state.calls[2]);
++	ZUC_ASSERT_EQ(order_info.windowId, state.order_info.windowId);
++	ZUC_ASSERT_EQ(order_info.fieldFlags, state.order_info.fieldFlags);
++	ZUC_ASSERT_EQ(window_state.ownerWindowId,
++		      state.window_state.ownerWindowId);
++	ZUC_ASSERT_EQ(window_state.showState, state.window_state.showState);
++}
+diff --git a/tests/weston-test-client-helper.c b/tests/weston-test-client-helper.c
+index 94b93eac..c46869c0 100644
+--- a/tests/weston-test-client-helper.c
++++ b/tests/weston-test-client-helper.c
+@@ -548,9 +548,22 @@ test_handle_capture_screenshot_done(void *data, struct weston_test *weston_test)
+ 	test->buffer_copy_done = 1;
+ }
+ 
++static void
++test_handle_surface_state(void *data, struct weston_test *weston_test,
++			  uint32_t mapped, wl_fixed_t x, wl_fixed_t y)
++{
++	struct test *test = data;
++
++	test->surface_state_received = true;
++	test->surface_mapped = mapped;
++	test->surface_x = x;
++	test->surface_y = y;
++}
++
+ static const struct weston_test_listener test_listener = {
+ 	test_handle_pointer_position,
+ 	test_handle_capture_screenshot_done,
++	test_handle_surface_state,
+ };
+ 
+ static void
+@@ -1637,6 +1650,22 @@ capture_screenshot_of_output(struct client *client)
+ 	return buffer;
+ }
+ 
++struct weston_test_surface_state
++get_surface_state(struct client *client, struct wl_surface *surface)
++{
++	struct weston_test_surface_state state;
++
++	client->test->surface_state_received = false;
++	weston_test_get_surface_state(client->test->weston_test, surface);
++	client_roundtrip(client);
++	assert(client->test->surface_state_received);
++
++	state.mapped = client->test->surface_mapped;
++	state.x = client->test->surface_x;
++	state.y = client->test->surface_y;
++	return state;
++}
++
+ static void
+ write_visual_diff(pixman_image_t *ref_image,
+ 		  struct buffer *shot,
+diff --git a/tests/weston-test-client-helper.h b/tests/weston-test-client-helper.h
+index bda330ea..29458398 100644
+--- a/tests/weston-test-client-helper.h
++++ b/tests/weston-test-client-helper.h
+@@ -74,6 +74,10 @@ struct test {
+ 	int pointer_y;
+ 	uint32_t n_egl_buffers;
+ 	int buffer_copy_done;
++	bool surface_state_received;
++	bool surface_mapped;
++	wl_fixed_t surface_x;
++	wl_fixed_t surface_y;
+ };
+ 
+ struct input {
+@@ -184,6 +188,12 @@ struct range {
+ 	int b;
+ };
+ 
++struct weston_test_surface_state {
++	bool mapped;
++	wl_fixed_t x;
++	wl_fixed_t y;
++};
++
+ struct client *
+ create_client(void);
+ 
+@@ -258,6 +268,9 @@ load_image_from_png(const char *fname);
+ struct buffer *
+ capture_screenshot_of_output(struct client *client);
+ 
++struct weston_test_surface_state
++get_surface_state(struct client *client, struct wl_surface *surface);
++
+ bool
+ verify_screen_content(struct client *client,
+ 		      const char *ref_image,
+diff --git a/tests/weston-test-fixture-compositor.c b/tests/weston-test-fixture-compositor.c
+index 0c9855f6..f1e922c3 100644
+--- a/tests/weston-test-fixture-compositor.c
++++ b/tests/weston-test-fixture-compositor.c
+@@ -217,6 +217,9 @@ renderer_to_arg(enum weston_compositor_backend b, enum renderer_type r)
+ 	case WESTON_BACKEND_HEADLESS:
+ 		assert(r >= RENDERER_NOOP && r <= RENDERER_GL);
+ 		return headless_names[r];
++	case WESTON_BACKEND_RDP:
++		assert(r == RENDERER_NOOP);
++		return NULL;
+ 	case WESTON_BACKEND_DRM:
+ 		assert(r >= RENDERER_PIXMAN && r <= RENDERER_GL);
+ 		return drm_names[r];
+@@ -235,6 +238,7 @@ shell_to_str(enum shell_type t)
+ 		[SHELL_DESKTOP] = "desktop-shell.so",
+ 		[SHELL_FULLSCREEN] = "fullscreen-shell.so",
+ 		[SHELL_IVI] = "ivi-shell.so",
++		[SHELL_RDPRAIL] = "rdprail-shell.so",
+ 	};
+ 	assert(t >= 0 && t < ARRAY_LENGTH(names));
+ 	return names[t];
+diff --git a/tests/weston-test-fixture-compositor.h b/tests/weston-test-fixture-compositor.h
+index fd8d0e5c..44d92762 100644
+--- a/tests/weston-test-fixture-compositor.h
++++ b/tests/weston-test-fixture-compositor.h
+@@ -59,7 +59,9 @@ enum shell_type {
+ 	/** The ivi-shell. */
+ 	SHELL_IVI,
+ 	/** The fullscreen-shell. */
+-	SHELL_FULLSCREEN
++	SHELL_FULLSCREEN,
++	/** The RDP remote application shell. */
++	SHELL_RDPRAIL
+ };
+ 
+ /** Weston compositor configuration
+diff --git a/tests/weston-test.c b/tests/weston-test.c
+index e3a0cb66..46af1c4e 100644
+--- a/tests/weston-test.c
++++ b/tests/weston-test.c
+@@ -599,6 +599,76 @@ send_touch(struct wl_client *client, struct wl_resource *resource,
+ 		     wl_fixed_to_double(y), touch_type);
+ }
+ 
++static void
++destroy_output(struct wl_client *client, struct wl_resource *resource,
++	       struct wl_resource *output_resource)
++{
++	struct weston_head *head = weston_head_from_resource(output_resource);
++
++	if (!head || !head->output) {
++		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
++				       "output is unavailable");
++		return;
++	}
++
++	weston_output_destroy(head->output);
++
++	(void)client;
++}
++
++static void
++set_output_mode(struct wl_client *client, struct wl_resource *resource,
++		struct wl_resource *output_resource, int32_t width, int32_t height)
++{
++	struct weston_head *head = weston_head_from_resource(output_resource);
++	struct weston_mode *mode;
++
++	if (!head || !head->output || width <= 0 || height <= 0) {
++		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
++				       "invalid output mode");
++		return;
++	}
++
++	mode = zalloc(sizeof *mode);
++	if (!mode) {
++		wl_resource_post_no_memory(resource);
++		return;
++	}
++	mode->width = width;
++	mode->height = height;
++	if (weston_output_mode_set_native(head->output, mode, 1) < 0) {
++		free(mode);
++		wl_resource_post_error(resource, WL_DISPLAY_ERROR_INVALID_OBJECT,
++				       "failed to set output mode");
++	}
++
++	(void)client;
++}
++
++static void
++get_surface_state(struct wl_client *client, struct wl_resource *resource,
++		  struct wl_resource *surface_resource)
++{
++	struct weston_surface *surface =
++		wl_resource_get_user_data(surface_resource);
++	struct weston_view *view;
++	float x = 0.0f, y = 0.0f;
++
++	if (!wl_list_empty(&surface->views))
++		view = container_of(surface->views.next, struct weston_view,
++				    surface_link);
++	else
++		view = NULL;
++	if (view)
++		weston_view_to_global_float(view, 0.0f, 0.0f, &x, &y);
++
++	weston_test_send_surface_state(resource,
++				       weston_surface_is_mapped(surface),
++				       wl_fixed_from_double(x), wl_fixed_from_double(y));
++
++	(void)client;
++}
++
+ static const struct weston_test_interface test_implementation = {
+ 	move_surface,
+ 	move_pointer,
+@@ -610,6 +680,9 @@ static const struct weston_test_interface test_implementation = {
+ 	device_add,
+ 	capture_screenshot,
+ 	send_touch,
++	destroy_output,
++	set_output_mode,
++	get_surface_state,
+ };
+ 
+ static void

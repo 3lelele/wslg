@@ -1,0 +1,1325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wslg-patches <patches@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] weston-mirror #172: rdp popup placement and window state
+ synchronization
+
+Upstream PR:  https://github.com/microsoft/weston-mirror/pull/172
+PR head:      d3f42ec964106b74fef70618b5dab3907464937b
+Fixes:        microsoft/wslg#1439, #1265, #1299 (GTK4 popups / submenus)
+
+Conflict resolution against #169 (bundled):
+
+- include/libweston/backend-rdp.h: keep set_window_owner/set_window_visible
+  from #169 and notify_popup_state from #172.
+- libweston/backend-rdp/rdprail.c: keep #169's more precise
+  `state_fields & WINDOW_ORDER_FIELD_SHOW` condition and put #172's
+  z-order notify/flush inside it.
+- tests/meson.build: re-add the popup-constraint / window-state-sync test
+  entries that the merge driver discarded.
+---
+ include/libweston-desktop/libweston-desktop.h |  13 ++
+ include/libweston/backend-rdp.h               |   5 +-
+ include/libweston/libweston.h                 |   3 +
+ libweston-desktop/internal.h                  |  20 ++
+ libweston-desktop/libweston-desktop.c         |  22 +++
+ libweston-desktop/meson.build                 |   2 +-
+ libweston-desktop/seat.c                      |  42 +++-
+ libweston-desktop/surface.c                   | 184 +++++++++++++++++-
+ libweston-desktop/xdg-shell-v6.c              |  45 ++++-
+ libweston-desktop/xdg-shell.c                 |  45 ++++-
+ libweston/backend-rdp/rdp.h                   |   5 +-
+ libweston/backend-rdp/rdprail.c               | 126 ++++++++++--
+ rdprail-shell/shell.c                         |  29 +++
+ shared/popup-constraint.h                     |  41 ++++
+ shared/window-state-sync.h                    |  49 +++++
+ tests/meson.build                             |   6 +
+ tests/popup-constraint-test.c                 |  56 ++++++
+ tests/window-state-sync-test.c                |  56 ++++++
+ 18 files changed, 699 insertions(+), 50 deletions(-)
+ create mode 100644 shared/popup-constraint.h
+ create mode 100644 shared/window-state-sync.h
+ create mode 100644 tests/popup-constraint-test.c
+ create mode 100644 tests/window-state-sync-test.c
+
+diff --git a/include/libweston-desktop/libweston-desktop.h b/include/libweston-desktop/libweston-desktop.h
+index 9c445071..aeb5bc5a 100644
+--- a/include/libweston-desktop/libweston-desktop.h
++++ b/include/libweston-desktop/libweston-desktop.h
+@@ -126,8 +126,21 @@ struct weston_desktop_api {
+ 	 */
+ 	void (*move_xwayland_position)(struct weston_desktop_surface *surface,
+ 				       int32_t x, int32_t y, void *user_data);
++	/* Optional global logical work area, excluding shell panels. */
++	void (*get_work_area)(struct weston_output *output,
++			     pixman_rectangle32_t *area, void *user_data);
++	/* Popup visibility is independent of the lifetime of its wl_surface. */
++	void (*popup_state_changed)(struct weston_desktop_surface *surface,
++				    bool mapped, void *user_data);
+ };
+ 
++void
++weston_desktop_surface_update_popup_positions(struct weston_desktop_surface *surface);
++
++void
++weston_seat_dismiss_popup_grab(struct weston_seat *seat,
++			     struct weston_surface *activated);
++
+ void
+ weston_seat_break_desktop_grabs(struct weston_seat *seat);
+ 
+diff --git a/include/libweston/backend-rdp.h b/include/libweston/backend-rdp.h
+index 4ccbde21..932dbd76 100644
+--- a/include/libweston/backend-rdp.h
++++ b/include/libweston/backend-rdp.h
+@@ -194,7 +194,6 @@ struct weston_rdprail_api {
+ 	/** Notify window proxy surface
+ 	 */
+ 	void (*notify_window_proxy_surface)(struct weston_surface *proxy_surface);
+-
+ 	/** Set the RAIL owner of a surface.
+ 	 */
+ 	void (*set_window_owner)(struct weston_surface *surface,
+@@ -204,6 +203,10 @@ struct weston_rdprail_api {
+ 	 */
+ 	void (*set_window_visible)(struct weston_surface *surface,
+ 				   bool visible);
++
++	/** Notify popup state change.
++	 */
++	void (*notify_popup_state)(struct weston_surface *surface, bool mapped);
+ };
+ 
+ static inline const struct weston_rdprail_api *
+diff --git a/include/libweston/libweston.h b/include/libweston/libweston.h
+index 745f378d..9b2d80ab 100644
+--- a/include/libweston/libweston.h
++++ b/include/libweston/libweston.h
+@@ -1572,6 +1572,9 @@ void
+ weston_view_from_global(struct weston_view *view,
+ 			int32_t x, int32_t y, int32_t *vx, int32_t *vy);
+ void
++weston_view_from_global_float(struct weston_view *view,
++			      float x, float y, float *vx, float *vy);
++void
+ weston_view_from_global_fixed(struct weston_view *view,
+ 			      wl_fixed_t x, wl_fixed_t y,
+ 			      wl_fixed_t *vx, wl_fixed_t *vy);
+diff --git a/libweston-desktop/internal.h b/libweston-desktop/internal.h
+index c7224a54..ce88d703 100644
+--- a/libweston-desktop/internal.h
++++ b/libweston-desktop/internal.h
+@@ -29,6 +29,26 @@
+ struct weston_desktop_seat;
+ struct weston_desktop_client;
+ 
++void
++weston_desktop_api_get_work_area(struct weston_desktop *desktop,
++				struct weston_output *output,
++				pixman_rectangle32_t *area);
++void
++weston_desktop_api_popup_state_changed(struct weston_desktop *desktop,
++				     struct weston_desktop_surface *surface,
++				     bool mapped);
++void
++weston_desktop_surface_set_popup(struct weston_desktop_surface *surface);
++void
++weston_desktop_surface_unmap_popup(struct weston_desktop_surface *surface);
++void
++weston_desktop_surface_constrain_popup(struct weston_desktop_surface *surface,
++				       struct weston_desktop_surface *parent,
++				       struct weston_geometry *geometry,
++				       struct weston_geometry anchor,
++				       struct weston_position offset,
++				       uint32_t adjustment);
++
+ struct weston_compositor *
+ weston_desktop_get_compositor(struct weston_desktop *desktop);
+ struct wl_display *
+diff --git a/libweston-desktop/libweston-desktop.c b/libweston-desktop/libweston-desktop.c
+index 23d38fc4..e06b20f8 100644
+--- a/libweston-desktop/libweston-desktop.c
++++ b/libweston-desktop/libweston-desktop.c
+@@ -45,6 +45,28 @@ struct weston_desktop {
+ 	struct wl_global *wl_shell;
+ };
+ 
++void
++weston_desktop_api_get_work_area(struct weston_desktop *desktop,
++				struct weston_output *output,
++				pixman_rectangle32_t *area)
++{
++	*area = (pixman_rectangle32_t) {
++		output->x, output->y, output->width, output->height
++	};
++	if (desktop->api.get_work_area)
++		desktop->api.get_work_area(output, area, desktop->user_data);
++}
++
++void
++weston_desktop_api_popup_state_changed(struct weston_desktop *desktop,
++				     struct weston_desktop_surface *surface,
++				     bool mapped)
++{
++	if (desktop->api.popup_state_changed)
++		desktop->api.popup_state_changed(surface, mapped,
++					 desktop->user_data);
++}
++
+ void
+ weston_desktop_destroy_request(struct wl_client *client,
+ 			       struct wl_resource *resource)
+diff --git a/libweston-desktop/meson.build b/libweston-desktop/meson.build
+index 0a45d941..b2ac19be 100644
+--- a/libweston-desktop/meson.build
++++ b/libweston-desktop/meson.build
+@@ -18,7 +18,7 @@ lib_desktop = shared_library(
+ 	include_directories: common_inc,
+ 	install: true,
+ 	version: '0.0.@0@'.format(libweston_revision),
+-	dependencies: dep_libweston_public
++	dependencies: [ dep_libweston_public, dep_libm ]
+ )
+ dep_lib_desktop = declare_dependency(
+ 	link_with: lib_desktop,
+diff --git a/libweston-desktop/seat.c b/libweston-desktop/seat.c
+index b92546df..cf7bfe9c 100644
+--- a/libweston-desktop/seat.c
++++ b/libweston-desktop/seat.c
+@@ -52,6 +52,40 @@ struct weston_desktop_seat {
+ 
+ static void weston_desktop_seat_popup_grab_end(struct weston_desktop_seat *seat);
+ 
++static bool
++popup_grab_contains_surface(struct weston_desktop_seat *seat,
++			    struct weston_surface *surface)
++{
++	struct wl_list *link;
++
++	if (!surface)
++		return false;
++	surface = weston_surface_get_main_surface(surface);
++	for (link = seat->popup_grab.surfaces.next;
++	     link != &seat->popup_grab.surfaces; link = link->next) {
++		struct weston_desktop_surface *popup =
++			weston_desktop_surface_from_grab_link(link);
++
++		if (weston_desktop_surface_get_surface(popup) == surface)
++			return true;
++	}
++	return false;
++}
++
++WL_EXPORT void
++weston_seat_dismiss_popup_grab(struct weston_seat *wseat,
++			     struct weston_surface *activated)
++{
++	struct weston_desktop_seat *seat;
++
++	if (!wseat)
++		return;
++	seat = weston_desktop_seat_from_seat(wseat);
++	if (seat && !wl_list_empty(&seat->popup_grab.surfaces) &&
++	    !popup_grab_contains_surface(seat, activated))
++		weston_desktop_seat_popup_grab_end(seat);
++}
++
+ static void
+ weston_desktop_seat_popup_grab_keyboard_key(struct weston_keyboard_grab *grab,
+ 					    const struct timespec *time,
+@@ -100,9 +134,7 @@ weston_desktop_seat_popup_grab_pointer_focus(struct weston_pointer_grab *grab)
+ 	view = weston_compositor_pick_view(pointer->seat->compositor,
+ 					   pointer->x, pointer->y, &sx, &sy);
+ 
+-	if (view != NULL &&
+-	    view->surface->resource != NULL &&
+-	    wl_resource_get_client(view->surface->resource) == seat->popup_grab.client)
++	if (view != NULL && popup_grab_contains_surface(seat, view->surface))
+ 		weston_pointer_set_focus(pointer, view, sx, sy);
+ 	else
+ 		weston_pointer_clear_focus(pointer);
+@@ -127,6 +159,8 @@ weston_desktop_seat_popup_grab_pointer_button(struct weston_pointer_grab *grab,
+ 	struct weston_pointer *pointer = grab->pointer;
+ 	bool initial_up = seat->popup_grab.initial_up;
+ 
++	weston_desktop_seat_popup_grab_pointer_focus(grab);
++
+ 	if (state == WL_POINTER_BUTTON_STATE_RELEASED)
+ 		seat->popup_grab.initial_up = true;
+ 
+@@ -327,7 +361,7 @@ weston_desktop_seat_popup_grab_end(struct weston_desktop_seat *seat)
+ 	struct weston_touch *touch = weston_seat_get_touch(seat->seat);
+ 
+ 	while (!wl_list_empty(&seat->popup_grab.surfaces)) {
+-		struct wl_list *link = seat->popup_grab.surfaces.prev;
++		struct wl_list *link = seat->popup_grab.surfaces.next;
+ 		struct weston_desktop_surface *surface =
+ 			weston_desktop_surface_from_grab_link(link);
+ 
+diff --git a/libweston-desktop/surface.c b/libweston-desktop/surface.c
+index 433f08ae..05971d0b 100644
+--- a/libweston-desktop/surface.c
++++ b/libweston-desktop/surface.c
+@@ -25,6 +25,8 @@
+ 
+ #include <string.h>
+ #include <assert.h>
++#include <math.h>
++#include <limits.h>
+ 
+ #include <wayland-server.h>
+ 
+@@ -33,6 +35,7 @@
+ 
+ #include <libweston-desktop/libweston-desktop.h>
+ #include "internal.h"
++#include "shared/popup-constraint.h"
+ 
+ struct weston_desktop_view {
+ 	struct wl_list link;
+@@ -55,6 +58,13 @@ struct weston_desktop_surface {
+ 	struct wl_listener surface_commit_listener;
+ 	struct wl_listener surface_destroy_listener;
+ 	struct wl_listener client_destroy_listener;
++	struct wl_listener transform_listener;
++	struct wl_listener output_resize_listener;
++	bool updating_position;
++	bool popup;
++	bool popup_mapped;
++	bool popup_dismissed;
++	bool popup_unmapped;
+ 	struct wl_list children_list;
+ 
+ 	struct wl_list resource_list;
+@@ -105,6 +115,103 @@ weston_desktop_surface_update_view_position(struct weston_desktop_surface *surfa
+ static void
+ weston_desktop_view_propagate_layer(struct weston_desktop_view *view);
+ 
++WL_EXPORT void
++weston_desktop_surface_update_popup_positions(struct weston_desktop_surface *surface)
++{
++	struct weston_desktop_surface *child;
++
++	if (surface->updating_position || surface->popup_dismissed ||
++	    surface->popup_unmapped)
++		return;
++	surface->updating_position = true;
++	if (surface->popup && surface->parent &&
++	    surface->implementation->update_position)
++		surface->implementation->update_position(surface,
++						 surface->implementation_data);
++	wl_list_for_each(child, &surface->children_list, children_link)
++		weston_desktop_surface_update_popup_positions(child);
++	surface->updating_position = false;
++}
++
++static void
++desktop_surface_transform_changed(struct wl_listener *listener, void *data)
++{
++	struct weston_desktop_surface *surface =
++		wl_container_of(listener, surface, transform_listener);
++	struct weston_desktop_surface *child;
++
++	if (data != surface->surface || surface->updating_position)
++		return;
++	/* A popup's own transform is the result, not an input, of placement. */
++	wl_list_for_each(child, &surface->children_list, children_link)
++		weston_desktop_surface_update_popup_positions(child);
++}
++
++static void
++desktop_surface_output_resized(struct wl_listener *listener, void *data)
++{
++	struct weston_desktop_surface *surface =
++		wl_container_of(listener, surface, output_resize_listener);
++
++	if (!surface->parent)
++		weston_desktop_surface_update_popup_positions(surface);
++}
++
++void
++weston_desktop_surface_set_popup(struct weston_desktop_surface *surface)
++{
++	surface->popup = true;
++}
++
++void
++weston_desktop_surface_constrain_popup(struct weston_desktop_surface *surface,
++				       struct weston_desktop_surface *parent,
++				       struct weston_geometry *geometry,
++				       struct weston_geometry anchor,
++				       struct weston_position offset,
++				       uint32_t adjustment)
++{
++	struct weston_view *view;
++	struct weston_geometry pg;
++	pixman_rectangle32_t area;
++	float x1, y1, x2, y2;
++	int64_t x = geometry->x, y = geometry->y;
++	int64_t width = geometry->width, height = geometry->height;
++	int64_t flip_x, flip_y;
++
++	if (!adjustment || wl_list_empty(&parent->surface->views))
++		return;
++	view = wl_container_of(parent->surface->views.next, view, surface_link);
++	weston_view_update_transform(view);
++	if (!view->output)
++		return;
++	weston_desktop_api_get_work_area(surface->desktop, view->output, &area);
++	if (!area.width || !area.height)
++		return;
++	pg = weston_desktop_surface_get_geometry(parent);
++	weston_view_from_global_float(view, area.x, area.y, &x1, &y1);
++	weston_view_from_global_float(view, (double)area.x + area.width,
++				     (double)area.y + area.height, &x2, &y2);
++	/* Reflect anchor and gravity, but preserve the requested offset. */
++	flip_x = 2 * (int64_t)anchor.x + anchor.width - x - width +
++		 2 * (int64_t)offset.x;
++	flip_y = 2 * (int64_t)anchor.y + anchor.height - y - height +
++		 2 * (int64_t)offset.y;
++	/* stable and v6 use the same constraint-adjustment bit values. */
++	popup_constrain_axis(&x, &width, flip_x,
++		ceil(fmin(x1, x2)) - pg.x, floor(fmax(x1, x2)) - pg.x,
++		adjustment & 4, adjustment & 1, adjustment & 16);
++	popup_constrain_axis(&y, &height, flip_y,
++		ceil(fmin(y1, y2)) - pg.y, floor(fmax(y1, y2)) - pg.y,
++		adjustment & 8, adjustment & 2, adjustment & 32);
++	if (x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX)
++		return;
++	geometry->x = x;
++	geometry->y = y;
++	geometry->width = width;
++	geometry->height = height;
++}
++
+ static void
+ weston_desktop_view_destroy(struct weston_desktop_view *view)
+ {
+@@ -129,6 +236,12 @@ weston_desktop_surface_destroy(struct weston_desktop_surface *surface)
+ 	struct weston_desktop_view *view, *next_view;
+ 	struct weston_desktop_surface *child, *next_child;
+ 
++	weston_desktop_surface_unmap_popup(surface);
++	wl_list_for_each_reverse(child, &surface->children_list, children_link)
++		weston_desktop_surface_unmap_popup(child);
++	wl_list_remove(&surface->transform_listener.link);
++	wl_list_remove(&surface->output_resize_listener.link);
++
+ 	wl_list_remove(&surface->surface_commit_listener.link);
+ 	wl_list_remove(&surface->surface_destroy_listener.link);
+ 	wl_list_remove(&surface->client_destroy_listener.link);
+@@ -170,6 +283,15 @@ weston_desktop_surface_surface_committed(struct wl_listener *listener,
+ 	struct weston_desktop_surface *surface =
+ 		wl_container_of(listener, surface, surface_commit_listener);
+ 
++	if (surface->popup) {
++		if (surface->popup_dismissed || surface->popup_unmapped)
++			return;
++		if (surface->popup_mapped && !surface->surface->buffer_ref.buffer) {
++			weston_desktop_surface_unmap_popup(surface);
++			return;
++		}
++	}
++
+ 	if (surface->implementation->committed != NULL)
+ 		surface->implementation->committed(surface,
+ 						   surface->implementation_data,
+@@ -179,12 +301,15 @@ weston_desktop_surface_surface_committed(struct wl_listener *listener,
+ 	if (surface->parent != NULL) {
+ 		struct weston_desktop_view *view;
+ 
++		/* Apply committed window geometry (including shadow offsets) before
++		 * mapping or emitting transforms used to position child popups. */
++		weston_desktop_surface_update_view_position(surface);
+ 		wl_list_for_each(view, &surface->view_list, link) {
+ 			weston_view_set_transform_parent(view->view,
+ 							 view->parent->view);
++			weston_view_update_transform(view->view);
+ 			weston_desktop_view_propagate_layer(view->parent);
+ 		}
+-		weston_desktop_surface_update_view_position(surface);
+ 	}
+ 
+ 	if (!wl_list_empty(&surface->children_list)) {
+@@ -196,6 +321,13 @@ weston_desktop_surface_surface_committed(struct wl_listener *listener,
+ 
+ 	surface->buffer_move.x = 0;
+ 	surface->buffer_move.y = 0;
++	weston_desktop_surface_update_popup_positions(surface);
++	if (surface->popup && !surface->popup_mapped &&
++	    surface->surface->buffer_ref.buffer) {
++		surface->popup_mapped = true;
++		weston_desktop_api_popup_state_changed(surface->desktop,
++						 surface, true);
++	}
+ }
+ 
+ static void
+@@ -260,6 +392,12 @@ weston_desktop_surface_create(struct weston_desktop *desktop,
+ 	surface->implementation = implementation;
+ 	surface->implementation_data = implementation_data;
+ 	surface->surface = wsurface;
++	surface->transform_listener.notify = desktop_surface_transform_changed;
++	wl_signal_add(&wsurface->compositor->transform_signal,
++		      &surface->transform_listener);
++	surface->output_resize_listener.notify = desktop_surface_output_resized;
++	wl_signal_add(&wsurface->compositor->output_resized_signal,
++		      &surface->output_resize_listener);
+ 
+ 	surface->client = client;
+ 	surface->client_destroy_listener.notify =
+@@ -435,6 +573,13 @@ weston_desktop_view_propagate_layer(struct weston_desktop_view *view)
+ 	wl_list_for_each_reverse(child, &view->children_list, children_link) {
+ 		struct weston_layer_entry *prev =
+ 			wl_container_of(link->prev, prev, link);
++		struct weston_desktop_surface *surface =
++			weston_surface_get_desktop_surface(child->view->surface);
++
++		/* The initial, bufferless xdg commit only requests configure. */
++		if (surface && surface->popup &&
++		    !child->view->surface->buffer_ref.buffer)
++			continue;
+ 
+ 		if (prev == &child->view->layer_link)
+ 			continue;
+@@ -746,8 +891,10 @@ weston_desktop_surface_set_relative_to(struct weston_desktop_surface *surface,
+ 	surface->position.y = y;
+ 	surface->use_geometry = use_geometry;
+ 
+-	if (surface->parent == parent)
++	if (surface->parent == parent) {
++		weston_desktop_surface_update_view_position(surface);
+ 		return;
++	}
+ 
+ 	surface->parent = parent;
+ 	wl_list_remove(&surface->children_link);
+@@ -768,6 +915,7 @@ weston_desktop_surface_set_relative_to(struct weston_desktop_surface *surface,
+ 		}
+ 
+ 		view->parent = parent_view;
++		weston_view_set_transform_parent(view->view, parent_view->view);
+ 		wl_list_insert(parent_view->children_list.prev,
+ 			       &view->children_link);
+ 		weston_desktop_view_propagate_layer(view);
+@@ -779,6 +927,7 @@ weston_desktop_surface_set_relative_to(struct weston_desktop_surface *surface,
+ 		view = wl_container_of(link, view, link);
+ 		weston_desktop_view_destroy(view);
+ 	}
++	weston_desktop_surface_update_view_position(surface);
+ }
+ 
+ void
+@@ -804,6 +953,12 @@ weston_desktop_surface_popup_grab(struct weston_desktop_surface *surface,
+ {
+ 	struct wl_client *wl_client =
+ 		weston_desktop_client_get_client(surface->client);
++
++	/* wl_shell can reuse a shell surface for another popup. */
++	if (!surface->popup) {
++		surface->popup_dismissed = false;
++		surface->popup_unmapped = false;
++	}
+ 	if (weston_desktop_seat_popup_grab_start(seat, wl_client, serial))
+ 		weston_desktop_seat_popup_grab_add_surface(seat, &surface->grab_link);
+ 	else
+@@ -819,12 +974,31 @@ weston_desktop_surface_popup_ungrab(struct weston_desktop_surface *surface,
+ 
+ void
+ weston_desktop_surface_popup_dismiss(struct weston_desktop_surface *surface)
++{
++	if (surface->popup_dismissed)
++		return;
++	surface->popup_dismissed = true;
++	weston_desktop_surface_unmap_popup(surface);
++	wl_list_remove(&surface->grab_link);
++	wl_list_init(&surface->grab_link);
++	weston_desktop_surface_close(surface);
++}
++
++void
++weston_desktop_surface_unmap_popup(struct weston_desktop_surface *surface)
+ {
+ 	struct weston_desktop_view *view, *tmp;
++	struct weston_desktop_surface *child;
++
++	if ((!surface->popup && !surface->popup_dismissed) ||
++	    surface->popup_unmapped)
++		return;
++	surface->popup_unmapped = true;
++	surface->popup_mapped = false;
++	wl_list_for_each_reverse(child, &surface->children_list, children_link)
++		weston_desktop_surface_unmap_popup(child);
+ 
+ 	wl_list_for_each_safe(view, tmp, &surface->view_list, link)
+ 		weston_desktop_view_destroy(view);
+-	wl_list_remove(&surface->grab_link);
+-	wl_list_init(&surface->grab_link);
+-	weston_desktop_surface_close(surface);
++	weston_desktop_api_popup_state_changed(surface->desktop, surface, false);
+ }
+diff --git a/libweston-desktop/xdg-shell-v6.c b/libweston-desktop/xdg-shell-v6.c
+index 955fccad..0fb8404c 100644
+--- a/libweston-desktop/xdg-shell-v6.c
++++ b/libweston-desktop/xdg-shell-v6.c
+@@ -123,9 +123,14 @@ struct weston_desktop_xdg_popup {
+ 	struct weston_desktop_xdg_surface *parent;
+ 	struct weston_desktop_seat *seat;
+ 	struct weston_geometry geometry;
++	struct weston_desktop_xdg_positioner positioner;
+ };
+ 
+-#define weston_desktop_surface_role_biggest_size (sizeof(struct weston_desktop_xdg_toplevel))
++#define weston_desktop_surface_role_biggest_size \
++	(sizeof(struct weston_desktop_xdg_toplevel) > \
++	 sizeof(struct weston_desktop_xdg_popup) ? \
++	 sizeof(struct weston_desktop_xdg_toplevel) : \
++	 sizeof(struct weston_desktop_xdg_popup))
+ #define weston_desktop_surface_configure_biggest_size (sizeof(struct weston_desktop_xdg_toplevel))
+ 
+ 
+@@ -172,7 +177,10 @@ weston_desktop_xdg_positioner_get_geometry(struct weston_desktop_xdg_positioner
+ 	if (positioner->constraint_adjustment == ZXDG_POSITIONER_V6_CONSTRAINT_ADJUSTMENT_NONE)
+ 		return geometry;
+ 
+-	/* TODO: add compositor policy configuration and the code here */
++	weston_desktop_surface_constrain_popup(dsurface, parent, &geometry,
++					       positioner->anchor_rect,
++					       positioner->offset,
++					       positioner->constraint_adjustment);
+ 
+ 	return geometry;
+ }
+@@ -829,13 +837,8 @@ weston_desktop_xdg_popup_update_position(struct weston_desktop_surface *dsurface
+ static void
+ weston_desktop_xdg_popup_committed(struct weston_desktop_xdg_popup *popup)
+ {
+-	struct weston_surface *wsurface =
+-		weston_desktop_surface_get_surface (popup->base.desktop_surface);
+-	struct weston_view *view;
+-
+-	wl_list_for_each(view, &wsurface->views, surface_link)
+-		weston_view_update_transform(view);
+-
++	/* surface.c applies the committed window geometry before transforming
++	 * and mapping views. Publishing a transform here exposes old offsets. */
+ 	if (!popup->committed)
+ 		weston_desktop_xdg_surface_schedule_configure(&popup->base);
+ 	popup->committed = true;
+@@ -847,6 +850,26 @@ static void
+ weston_desktop_xdg_popup_update_position(struct weston_desktop_surface *dsurface,
+ 					 void *user_data)
+ {
++	struct weston_desktop_xdg_popup *popup = user_data;
++	struct weston_desktop_surface *parent;
++	struct weston_geometry geometry;
++
++	if (popup->base.role != WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP)
++		return;
++	parent = weston_desktop_surface_get_parent(dsurface);
++	if (!parent)
++		return;
++	geometry = weston_desktop_xdg_positioner_get_geometry(
++		&popup->positioner, dsurface, parent);
++	if (geometry.x == popup->geometry.x && geometry.y == popup->geometry.y &&
++	    geometry.width == popup->geometry.width &&
++	    geometry.height == popup->geometry.height)
++		return;
++	popup->geometry = geometry;
++	weston_desktop_surface_set_relative_to(dsurface, parent,
++					       geometry.x, geometry.y, true);
++	if (popup->committed)
++		weston_desktop_xdg_surface_schedule_configure(&popup->base);
+ }
+ 
+ static void
+@@ -1081,6 +1104,10 @@ weston_desktop_xdg_surface_protocol_get_popup(struct wl_client *wl_client,
+ 
+ 	popup->base.role = WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP;
+ 	popup->parent = parent;
++	popup->positioner = *positioner;
++	/* The client may destroy the positioner immediately after get_popup. */
++	popup->positioner.resource = NULL;
++	weston_desktop_surface_set_popup(popup->base.desktop_surface);
+ 
+ 	popup->geometry =
+ 		weston_desktop_xdg_positioner_get_geometry(positioner,
+diff --git a/libweston-desktop/xdg-shell.c b/libweston-desktop/xdg-shell.c
+index 4a9eb977..2a0ad599 100644
+--- a/libweston-desktop/xdg-shell.c
++++ b/libweston-desktop/xdg-shell.c
+@@ -129,9 +129,14 @@ struct weston_desktop_xdg_popup {
+ 	struct weston_desktop_xdg_surface *parent;
+ 	struct weston_desktop_seat *seat;
+ 	struct weston_geometry geometry;
++	struct weston_desktop_xdg_positioner positioner;
+ };
+ 
+-#define weston_desktop_surface_role_biggest_size (sizeof(struct weston_desktop_xdg_toplevel))
++#define weston_desktop_surface_role_biggest_size \
++	(sizeof(struct weston_desktop_xdg_toplevel) > \
++	 sizeof(struct weston_desktop_xdg_popup) ? \
++	 sizeof(struct weston_desktop_xdg_toplevel) : \
++	 sizeof(struct weston_desktop_xdg_popup))
+ #define weston_desktop_surface_configure_biggest_size (sizeof(struct weston_desktop_xdg_toplevel))
+ 
+ 
+@@ -210,7 +215,10 @@ weston_desktop_xdg_positioner_get_geometry(struct weston_desktop_xdg_positioner
+ 	if (positioner->constraint_adjustment == XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_NONE)
+ 		return geometry;
+ 
+-	/* TODO: add compositor policy configuration and the code here */
++	weston_desktop_surface_constrain_popup(dsurface, parent, &geometry,
++					       positioner->anchor_rect,
++					       positioner->offset,
++					       positioner->constraint_adjustment);
+ 
+ 	return geometry;
+ }
+@@ -869,13 +877,8 @@ weston_desktop_xdg_popup_update_position(struct weston_desktop_surface *dsurface
+ static void
+ weston_desktop_xdg_popup_committed(struct weston_desktop_xdg_popup *popup)
+ {
+-	struct weston_surface *wsurface =
+-		weston_desktop_surface_get_surface (popup->base.desktop_surface);
+-	struct weston_view *view;
+-
+-	wl_list_for_each(view, &wsurface->views, surface_link)
+-		weston_view_update_transform(view);
+-
++	/* surface.c applies the committed window geometry before transforming
++	 * and mapping views. Publishing a transform here exposes old offsets. */
+ 	if (!popup->committed)
+ 		weston_desktop_xdg_surface_schedule_configure(&popup->base);
+ 	popup->committed = true;
+@@ -887,6 +890,26 @@ static void
+ weston_desktop_xdg_popup_update_position(struct weston_desktop_surface *dsurface,
+ 					 void *user_data)
+ {
++	struct weston_desktop_xdg_popup *popup = user_data;
++	struct weston_desktop_surface *parent;
++	struct weston_geometry geometry;
++
++	if (popup->base.role != WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP)
++		return;
++	parent = weston_desktop_surface_get_parent(dsurface);
++	if (!parent)
++		return;
++	geometry = weston_desktop_xdg_positioner_get_geometry(
++		&popup->positioner, dsurface, parent);
++	if (geometry.x == popup->geometry.x && geometry.y == popup->geometry.y &&
++	    geometry.width == popup->geometry.width &&
++	    geometry.height == popup->geometry.height)
++		return;
++	popup->geometry = geometry;
++	weston_desktop_surface_set_relative_to(dsurface, parent,
++					       geometry.x, geometry.y, true);
++	if (popup->committed)
++		weston_desktop_xdg_surface_schedule_configure(&popup->base);
+ }
+ 
+ static void
+@@ -1134,6 +1157,10 @@ weston_desktop_xdg_surface_protocol_get_popup(struct wl_client *wl_client,
+ 
+ 	popup->base.role = WESTON_DESKTOP_XDG_SURFACE_ROLE_POPUP;
+ 	popup->parent = parent;
++	popup->positioner = *positioner;
++	/* The client may destroy the positioner immediately after get_popup. */
++	popup->positioner.resource = NULL;
++	weston_desktop_surface_set_popup(popup->base.desktop_surface);
+ 
+ 	popup->geometry =
+ 		weston_desktop_xdg_positioner_get_geometry(positioner,
+diff --git a/libweston/backend-rdp/rdp.h b/libweston/backend-rdp/rdp.h
+index 8ba0deeb..6ea7eb87 100644
+--- a/libweston/backend-rdp/rdp.h
++++ b/libweston/backend-rdp/rdp.h
+@@ -26,6 +26,8 @@
+ #ifndef RDP_H
+ #define RDP_H
+ 
++#include "shared/window-state-sync.h"
++
+ #include <freerdp/version.h>
+ 
+ #include <freerdp/freerdp.h>
+@@ -261,7 +263,8 @@ struct rdp_peer_context {
+ 	struct wl_listener idle_listener;
+ 	struct wl_listener wake_listener;
+ 
+-	bool is_window_zorder_dirty;
++	struct weston_window_state_sync window_zorder_sync;
++	struct wl_event_source *window_zorder_timer;
+ 
+ 	// Multiple monitor support (monitor topology)
+ 	int32_t desktop_top, desktop_left, desktop_width, desktop_height;
+diff --git a/libweston/backend-rdp/rdprail.c b/libweston/backend-rdp/rdprail.c
+index 06e2497c..2240b945 100644
+--- a/libweston/backend-rdp/rdprail.c
++++ b/libweston/backend-rdp/rdprail.c
+@@ -57,6 +57,9 @@
+ extern PWtsApiFunctionTable FreeRDP_InitWtsApi(void);
+ 
+ static void rdp_rail_destroy_window(struct wl_listener *listener, void *data);
++static void rdp_rail_notify_window_zorder_change(struct weston_compositor *compositor);
++static bool rdp_rail_flush_window_zorder(struct rdp_backend *b);
++static void rdp_rail_schedule_window_zorder(void *data, int delay_ms);
+ static void rdp_rail_schedule_update_window(struct wl_listener *listener, void *data);
+ static void rdp_rail_dump_window_label(struct weston_surface *surface, char *label, uint32_t label_size);
+ 
+@@ -1861,7 +1864,7 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ 	/* TODO: ideally this better be triggered from shell, but shell isn't notified
+ 		 creation/destruction of certain type of window, such as dropdown menu
+ 		 (popup in Wayland, override_redirect in X), thus do it here. */
+-	peer_ctx->is_window_zorder_dirty = true;
++	rdp_rail_notify_window_zorder_change(compositor);
+ 
+ Exit:
+ 	/* once window is successfully created, start listening repaint update */
+@@ -2013,7 +2016,7 @@ rdp_rail_destroy_window(struct wl_listener *listener, void *data)
+ 	/* TODO: ideally this better be triggered from shell, but shell isn't notified
+ 		 creation/destruction of certain type of window, such as dropdown menu
+ 		 (popup in Wayland, override_redirect in X), thus do it here. */
+-	peer_ctx->is_window_zorder_dirty = true;
++	rdp_rail_notify_window_zorder_change(compositor);
+ 
+ 	if (rail_state->repaint_listener.notify) {
+ 		wl_list_remove(&rail_state->repaint_listener.link);
+@@ -2336,6 +2339,9 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 		}
+ 
+ 		if (state_fields & WINDOW_ORDER_FIELD_SHOW) {
++			rdp_rail_notify_window_zorder_change(compositor);
++			if (!rdp_rail_flush_window_zorder(b))
++				return 0;
+ 			rdp_debug_verbose(b, "WindowUpdate(0x%x - showState:%s -> %s)\n",
+ 					  window_id,
+ 					  rdp_showstate_to_string(rail_state->showState),
+@@ -2363,6 +2369,7 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 				rail_state->forceUpdateWindowState = true;
+ 			}
+ 			rail_state->showState = rail_state->showState_requested;
++			rdp_rail_notify_window_zorder_change(compositor);
+ 		}
+ 
+ 		if (rail_state->forceUpdateWindowState ||
+@@ -3027,7 +3034,7 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 			   solution would make those surface visible to shell or hook signal on
+ 			   when view_list is changed on libweston/compositor.c */
+ 			if (!rail_state->isFirstUpdateDone) {
+-				peer_ctx->is_window_zorder_dirty = true;
++				rdp_rail_notify_window_zorder_change(compositor);
+ 				rail_state->isFirstUpdateDone = true;
+ 			}
+ 		}
+@@ -3149,7 +3156,7 @@ rdp_insert_window_zorder_array(struct weston_view *view,
+ 	   minimized), those won't included in z order list. */
+ 	if (rail_state &&
+ 	    rail_state->isWindowCreated &&
+-	    rail_state->showState != RDP_WINDOW_SHOW_MINIMIZED &&
++	    rail_state->showState_requested != RDP_WINDOW_HIDE &&
+ 	    rail_state->showState_requested != RDP_WINDOW_SHOW_MINIMIZED) {
+ 		if (iCurrent >= WindowIdArraySize) {
+ 			rdp_debug_error(b, "%s: more windows in tree than ID manager tracking (%d vs %d)\n",
+@@ -3172,7 +3179,7 @@ rdp_insert_window_zorder_array(struct weston_view *view,
+ 	return iCurrent;
+ }
+ 
+-static void
++static bool
+ rdp_rail_sync_window_zorder(struct weston_compositor *compositor)
+ {
+ 	struct rdp_backend *b = to_rdp_backend(compositor);
+@@ -3183,15 +3190,16 @@ rdp_rail_sync_window_zorder(struct weston_compositor *compositor)
+ 	WINDOW_ORDER_INFO window_order_info = {};
+ 	MONITORED_DESKTOP_ORDER monitored_desktop_order = {};
+ 	uint32_t iCurrent = 0;
++	bool sent = false;
+ 
+ 	assert_compositor_thread(b);
+ 
+ 	if (!b->enable_window_zorder_sync)
+-		return;
++		return true;
+ 
+ 	numWindowId = peer_ctx->windowId.id_used;
+ 	if (numWindowId == 0)
+-		return;
++		return true;
+ 	/* +1 for marker window (aka proxy_surface) */
+ 	numWindowId++;
+ 	windowIdArray = xzalloc(numWindowId * sizeof(uint32_t));
+@@ -3221,18 +3229,19 @@ rdp_rail_sync_window_zorder(struct weston_compositor *compositor)
+ 		}
+ 	}
+ 	assert(iCurrent <= numWindowId);
+-	if (iCurrent > 0) {
++	{
+ 		rdp_debug_verbose(b, "    send Window Z order: numWindowIds:%d\n",
+ 				  iCurrent);
+ 
+ 		window_order_info.fieldFlags = WINDOW_ORDER_TYPE_DESKTOP |
+ 					       WINDOW_ORDER_FIELD_DESKTOP_ZORDER |
+ 					       WINDOW_ORDER_FIELD_DESKTOP_ACTIVE_WND;
+-		monitored_desktop_order.activeWindowId = windowIdArray[0];
++		monitored_desktop_order.activeWindowId =
++			iCurrent ? windowIdArray[0] : 0;
+ 		monitored_desktop_order.numWindowIds = iCurrent;
+ 		monitored_desktop_order.windowIds = windowIdArray;
+ 
+-		client->context->update->window->MonitoredDesktop(client->context,
++		sent = client->context->update->window->MonitoredDesktop(client->context,
+ 								  &window_order_info,
+ 								  &monitored_desktop_order);
+ 		client->DrainOutputBuffer(client);
+@@ -3241,7 +3250,7 @@ rdp_rail_sync_window_zorder(struct weston_compositor *compositor)
+ Exit:
+ 	free(windowIdArray);
+ 
+-	return;
++	return sent;
+ }
+ 
+ void
+@@ -3252,16 +3261,16 @@ rdp_rail_output_repaint(struct weston_output *output,
+ 	struct rdp_backend *b = to_rdp_backend(ec);
+ 	RdpPeerContext *peer_ctx = (RdpPeerContext *)b->rdp_peer->context;
+ 
++	/* Window orders must not wait for graphics acknowledgements or damage. */
++	if (!rdp_rail_flush_window_zorder(b))
++		return;
++
+ 	if (peer_ctx->isAcknowledgedSuspended ||
+ 	    ((peer_ctx->currentFrameId - peer_ctx->acknowledgedFrameId) < 2)) {
+ 		struct update_window_iter_data iter_data = {};
+ 
+ 		/* notify window z order to client first,
+ 		   mstsc/msrdc needs this to be sent before window update. */
+-		if (peer_ctx->is_window_zorder_dirty) {
+-			rdp_rail_sync_window_zorder(b->compositor);
+-			peer_ctx->is_window_zorder_dirty = false;
+-		}
+ 		rdp_debug_verbose(b, "currentFrameId:0x%x, acknowledgedFrameId:0x%x, isAcknowledgedSuspended:%d\n",
+ 				   peer_ctx->currentFrameId,
+ 				   peer_ctx->acknowledgedFrameId,
+@@ -3697,16 +3706,86 @@ rdp_rail_notify_window_proxy_surface(struct weston_surface *proxy_surface)
+ 	b->proxy_surface = proxy_surface;
+ }
+ 
++static bool
++rdp_rail_send_window_zorder(void *data)
++{
++	struct rdp_backend *b = data;
++
++	return rdp_rail_sync_window_zorder(b->compositor);
++}
++
++static bool
++rdp_rail_flush_window_zorder(struct rdp_backend *b)
++{
++	RdpPeerContext *peer_ctx = (RdpPeerContext *)b->rdp_peer->context;
++
++	return weston_window_state_flush(&peer_ctx->window_zorder_sync,
++		peer_ctx->activationRailCompleted &&
++		peer_ctx->activationGraphicsCompleted,
++		rdp_rail_send_window_zorder, rdp_rail_schedule_window_zorder, b);
++}
++
++static int
++rdp_rail_window_zorder_timer(void *data)
++{
++	struct rdp_backend *b = data;
++
++	rdp_rail_flush_window_zorder(b);
++	return 0;
++}
++
++static void
++rdp_rail_schedule_window_zorder(void *data, int delay_ms)
++{
++	struct rdp_backend *b = data;
++	RdpPeerContext *peer_ctx = (RdpPeerContext *)b->rdp_peer->context;
++
++	if (!peer_ctx->window_zorder_timer)
++		peer_ctx->window_zorder_timer = wl_event_loop_add_timer(
++			wl_display_get_event_loop(b->compositor->wl_display),
++			rdp_rail_window_zorder_timer, b);
++	if (peer_ctx->window_zorder_timer)
++		wl_event_source_timer_update(peer_ctx->window_zorder_timer, delay_ms);
++}
++
++static void
++rdp_rail_notify_popup_state(struct weston_surface *surface, bool mapped)
++{
++	struct rdp_backend *b = to_rdp_backend(surface->compositor);
++	struct weston_surface_rail_state *state = surface->backend_state;
++	struct weston_subsurface *sub;
++
++	/* GTK may render a popup using separately remoted subsurfaces. */
++	wl_list_for_each(sub, &surface->subsurface_list, parent_link) {
++		if (sub->surface != surface)
++			rdp_rail_notify_popup_state(sub->surface, mapped);
++	}
++
++	if (mapped) {
++		if (!state || !state->window_id)
++			rdp_rail_create_window(NULL, surface);
++		weston_surface_damage(surface);
++	} else if (state) {
++		rdp_rail_destroy_window(NULL, surface);
++	}
++	rdp_rail_notify_window_zorder_change(b->compositor);
++}
++
+ static void
+ rdp_rail_notify_window_zorder_change(struct weston_compositor *compositor)
+ {
+ 	struct rdp_backend *b = to_rdp_backend(compositor);
+-	RdpPeerContext *peer_ctx = (RdpPeerContext *)b->rdp_peer->context;
++	RdpPeerContext *peer_ctx;
+ 
+ 	assert_compositor_thread(b);
+ 
+-	/* z order will be sent to client at next repaint */
+-	peer_ctx->is_window_zorder_dirty = true;
++	if (!b->rdp_peer || !b->rdp_peer->context)
++		return;
++	peer_ctx = (RdpPeerContext *)b->rdp_peer->context;
++	if (!b->enable_window_zorder_sync)
++		return;
++	weston_window_state_mark(&peer_ctx->window_zorder_sync,
++				 rdp_rail_schedule_window_zorder, b);
+ }
+ 
+ void
+@@ -3824,12 +3903,12 @@ rdp_rail_sync_window_status(freerdp_peer *client)
+ 	}
+ 
+ 	if (anyWindowCreated) {
+-		/* resync window zorder with RDP client */
+-		peer_ctx->is_window_zorder_dirty = true;
+ 		/* this assume repaint to be scheduled on idle loop, not directly from here */
+ 		weston_compositor_wake(b->compositor);
+ 		weston_compositor_damage_all(b->compositor);
+ 	}
++	/* Reconnection must also repair surviving windows in an idle scene. */
++	rdp_rail_notify_window_zorder_change(b->compositor);
+ }
+ 
+ static void
+@@ -4075,6 +4154,12 @@ rdp_rail_peer_context_free(freerdp_peer *client, RdpPeerContext *context)
+ 	RdpgfxServerContext *gfx_ctx;
+ 	DispServerContext *disp_ctx;
+ 
++	weston_window_state_stop(&context->window_zorder_sync);
++	if (context->window_zorder_timer) {
++		wl_event_source_remove(context->window_zorder_timer);
++		context->window_zorder_timer = NULL;
++	}
++
+ 	rail_ctx = context->rail_server_context;
+ 	gfx_ctx = context->rail_grfx_server_context;
+ 	disp_ctx = context->disp_server_context;
+@@ -4946,6 +5031,7 @@ struct weston_rdprail_api rdprail_api = {
+ #endif /* HAVE_FREERDP_RDPAPPLIST_H */
+ 	.get_primary_output = rdp_rail_get_primary_output,
+ 	.notify_window_zorder_change = rdp_rail_notify_window_zorder_change,
++	.notify_popup_state = rdp_rail_notify_popup_state,
+ 	.notify_window_proxy_surface = rdp_rail_notify_window_proxy_surface,
+ 	.set_window_owner = rdp_rail_set_window_owner,
+ 	.set_window_visible = rdp_rail_set_window_visible,
+diff --git a/rdprail-shell/shell.c b/rdprail-shell/shell.c
+index c8a351b6..1f293334 100644
+--- a/rdprail-shell/shell.c
++++ b/rdprail-shell/shell.c
+@@ -3400,7 +3400,27 @@ desktop_surface_move_xwayland_position(struct weston_desktop_surface *desktop_su
+ 	}
+ }
+ 
++static void
++desktop_get_work_area(struct weston_output *output,
++		      pixman_rectangle32_t *area, void *data)
++{
++	get_output_work_area(data, output, area);
++}
++
++static void
++desktop_popup_state_changed(struct weston_desktop_surface *desktop_surface,
++			    bool mapped, void *data)
++{
++	struct desktop_shell *shell = data;
++
++	if (shell->rdprail_api->notify_popup_state)
++		shell->rdprail_api->notify_popup_state(
++			weston_desktop_surface_get_surface(desktop_surface), mapped);
++}
++
+ static const struct weston_desktop_api shell_desktop_api = {
++	.get_work_area = desktop_get_work_area,
++	.popup_state_changed = desktop_popup_state_changed,
+ 	.struct_size = sizeof(struct weston_desktop_api),
+ 	.surface_added = desktop_surface_added,
+ 	.surface_removed = desktop_surface_removed,
+@@ -4001,6 +4021,8 @@ shell_backend_request_window_activate(void *shell_context, struct weston_seat *s
+ 	struct weston_view *view;
+ 	struct shell_surface *shsurf;
+ 
++	weston_seat_dismiss_popup_grab(seat, surface);
++
+ 	if (!surface) {
+ 		/* Here, focus is moving to a window in client side, thus none of Linux app has focus,
+ 		   so move the focus to dummy marker window (focus_proxy), thus the rest of Linux app
+@@ -4753,6 +4775,13 @@ shell_backend_set_desktop_workarea(struct weston_output *output, void *context,
+ 
+ 		shell_output->desktop_workarea = *workarea;
+ 		shell_for_each_layer(shell, shell_workarea_changed_layer, (void*)&workarea_change);
++		struct weston_view *view;
++		wl_list_for_each(view, &shell->compositor->view_list, link) {
++			struct weston_desktop_surface *ds =
++				weston_surface_get_desktop_surface(view->surface);
++			if (ds)
++				weston_desktop_surface_update_popup_positions(ds);
++		}
+ 	}
+ }
+ 
+diff --git a/shared/popup-constraint.h b/shared/popup-constraint.h
+new file mode 100644
+index 00000000..633dfaf6
+--- /dev/null
++++ b/shared/popup-constraint.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef WESTON_POPUP_CONSTRAINT_H
++#define WESTON_POPUP_CONSTRAINT_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* Work in 64 bits: positioner coordinates are client supplied int32_t. */
++static inline bool
++popup_axis_fits(int64_t pos, int64_t size, int64_t lo, int64_t hi)
++{
++	return pos >= lo && pos + size <= hi;
++}
++
++static inline void
++popup_constrain_axis(int64_t *pos, int64_t *size, int64_t flipped,
++		     int64_t lo, int64_t hi, bool flip, bool slide, bool resize)
++{
++	int64_t end;
++
++	if (hi <= lo || popup_axis_fits(*pos, *size, lo, hi))
++		return;
++	if (flip && popup_axis_fits(flipped, *size, lo, hi))
++		*pos = flipped;
++	if (slide) {
++		if (*pos + *size > hi)
++			*pos = hi - *size;
++		if (*pos < lo)
++			*pos = lo;
++	}
++	if (resize && !popup_axis_fits(*pos, *size, lo, hi)) {
++		end = *pos + *size < hi ? *pos + *size : hi;
++		if (*pos < lo)
++			*pos = lo;
++		/* A disjoint rectangle cannot be resized into the work area. */
++		if (end > *pos)
++			*size = end - *pos;
++	}
++}
++
++#endif
+diff --git a/shared/window-state-sync.h b/shared/window-state-sync.h
+new file mode 100644
+index 00000000..14b9b3f8
+--- /dev/null
++++ b/shared/window-state-sync.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef WESTON_WINDOW_STATE_SYNC_H
++#define WESTON_WINDOW_STATE_SYNC_H
++
++#include <stdbool.h>
++
++struct weston_window_state_sync {
++	bool dirty;
++	bool stopped;
++};
++
++typedef void (*weston_state_schedule_func)(void *data, int delay_ms);
++typedef bool (*weston_state_send_func)(void *data);
++
++static inline void
++weston_window_state_mark(struct weston_window_state_sync *sync,
++			 weston_state_schedule_func schedule, void *data)
++{
++	if (sync->stopped || sync->dirty)
++		return;
++	sync->dirty = true;
++	schedule(data, 1);
++}
++
++static inline bool
++weston_window_state_flush(struct weston_window_state_sync *sync, bool ready,
++			  weston_state_send_func send,
++			  weston_state_schedule_func schedule, void *data)
++{
++	if (sync->stopped)
++		return false;
++	if (!sync->dirty)
++		return true;
++	if (ready && send(data)) {
++		sync->dirty = false;
++		return true;
++	}
++	schedule(data, 100);
++	return false;
++}
++
++static inline void
++weston_window_state_stop(struct weston_window_state_sync *sync)
++{
++	sync->stopped = true;
++	sync->dirty = false;
++}
++
++#endif
+diff --git a/tests/meson.build b/tests/meson.build
+index 272becae..31f7351f 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -1,3 +1,9 @@
++foreach name : ['popup-constraint', 'window-state-sync']
++	exe = executable('test-' + name, name + '-test.c',
++		include_directories: common_inc, install: false)
++	test(name, exe)
++endforeach
++
+ plugin_test_shell_desktop = shared_library(
+ 	'weston-test-desktop-shell',
+ 	'weston-test-desktop-shell.c',
+diff --git a/tests/popup-constraint-test.c b/tests/popup-constraint-test.c
+new file mode 100644
+index 00000000..63fe6f7f
+--- /dev/null
++++ b/tests/popup-constraint-test.c
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: MIT */
++#include <assert.h>
++#include <stddef.h>
++#include "shared/popup-constraint.h"
++
++struct axis_case {
++	int64_t pos, size, flipped, lo, hi;
++	bool flip, slide, resize;
++	int64_t expected_pos, expected_size;
++};
++
++int
++main(void)
++{
++	const struct axis_case cases[] = {
++		/* Right and bottom edges: flip before sliding over the parent. */
++		{ 950, 200, 550, 0, 1000, true, true, true, 550, 200 },
++		{ 750, 200, 350, 0, 800, true, true, true, 350, 200 },
++		/* Left and top panels, including negative output coordinates. */
++		{ 0, 100, 200, 40, 1000, true, true, false, 200, 100 },
++		{ -30, 100, 100, 40, 800, true, true, false, 100, 100 },
++		{ -1100, 200, -900, -1000, 0, true, true, false, -900, 200 },
++		/* No permission means no adjustment. */
++		{ 950, 200, 550, 0, 1000, false, false, false, 950, 200 },
++		/* Failed flip must fall back to the original, then slide. */
++		{ 950, 200, -300, 0, 1000, true, true, false, 800, 200 },
++		{ 950, 200, -300, 0, 1000, true, false, false, 950, 200 },
++		/* Oversized menu, resize alone, and disjoint geometry. */
++		{ 500, 1200, -800, 0, 1000, true, true, true, 0, 1000 },
++		{ 900, 200, 500, 0, 1000, false, false, true, 900, 100 },
++		{ 1200, 200, 1100, 0, 1000, true, false, true, 1200, 200 },
++		/* Logical coordinates after a 2x output conversion. */
++		{ 475, 100, 275, 0, 500, true, true, false, 275, 100 },
++		{ 100, 100, 0, 0, 800, true, true, true, 100, 100 },
++		{ INT32_MAX, 200, INT32_MAX - 400, 0, INT32_MAX,
++		  true, true, false, INT32_MAX - 400, 200 },
++	};
++
++	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
++		const struct axis_case *c = &cases[i];
++		int64_t pos = c->pos, size = c->size;
++
++		popup_constrain_axis(&pos, &size, c->flipped, c->lo, c->hi,
++				     c->flip, c->slide, c->resize);
++		assert(pos == c->expected_pos && size == c->expected_size);
++		/* Re-evaluating unchanged inputs must never toggle direction. */
++		for (int frame = 0; frame < 100; frame++) {
++			pos = c->pos;
++			size = c->size;
++			popup_constrain_axis(&pos, &size, c->flipped, c->lo, c->hi,
++					     c->flip, c->slide, c->resize);
++			assert(pos == c->expected_pos && size == c->expected_size);
++		}
++	}
++	return 0;
++}
+diff --git a/tests/window-state-sync-test.c b/tests/window-state-sync-test.c
+new file mode 100644
+index 00000000..3422c47b
+--- /dev/null
++++ b/tests/window-state-sync-test.c
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: MIT */
++#include <assert.h>
++#include "shared/window-state-sync.h"
++
++struct recorder {
++	int schedules, delay, sends, updates;
++	bool success;
++};
++
++static void
++schedule(void *data, int delay)
++{
++	struct recorder *r = data;
++
++	r->schedules++;
++	r->delay = delay;
++}
++
++static bool
++send(void *data)
++{
++	struct recorder *r = data;
++
++	assert(r->updates == 0);
++	r->sends++;
++	return r->success;
++}
++
++int
++main(void)
++{
++	struct weston_window_state_sync sync = { 0 };
++	struct recorder r = { 0 };
++
++	/* A quiet scene still schedules a send; repeated events coalesce. */
++	weston_window_state_mark(&sync, schedule, &r);
++	weston_window_state_mark(&sync, schedule, &r);
++	assert(r.schedules == 1 && r.delay == 1);
++	assert(!weston_window_state_flush(&sync, false, send, schedule, &r));
++	assert(sync.dirty && r.sends == 0 && r.delay == 100);
++	assert(!weston_window_state_flush(&sync, true, send, schedule, &r));
++	assert(sync.dirty && r.sends == 1);
++	r.success = true;
++	assert(weston_window_state_flush(&sync, true, send, schedule, &r));
++	assert(!sync.dirty && r.sends == 2);
++	r.updates++; /* Window updates are allowed only after successful flush. */
++	assert(weston_window_state_flush(&sync, true, send, schedule, &r));
++	assert(r.sends == 2);
++	weston_window_state_mark(&sync, schedule, &r);
++	weston_window_state_stop(&sync);
++	weston_window_state_stop(&sync);
++	assert(!weston_window_state_flush(&sync, true, send, schedule, &r));
++	weston_window_state_mark(&sync, schedule, &r);
++	assert(!sync.dirty && r.sends == 2);
++	return 0;
++}

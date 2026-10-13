@@ -1,0 +1,2 @@
+# weston 补丁里含 CRLF 文件的上下文行，禁止 git 做任何行尾转换，否则补丁套不上
+patches/weston/*.patch -text

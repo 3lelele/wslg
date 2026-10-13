@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wslg-patches <patches@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] rdprail-shell: give xdg_popup RAIL windows their parent as
+ owner
+
+#169 makes the input panel a RAIL window owned by the toplevel holding the
+text_input (JBR binds text-input on the toplevel). Windows raises the whole
+owner tree when it activates an owned window, so an xdg_popup without an
+owner (rdprail.c only sets one for wl_subsurface) drops behind its own
+toplevel the instant the fcitx5 candidate window appears: the Ctrl+N popup
+"disappears" and comes back when the candidate window closes and weston
+resends the Z order. weston's own Z order and views are correct throughout;
+the problem is purely on the Windows side.
+
+Fix: when a popup is mapped (popup_state_changed hook from #172), set its
+RAIL owner to its parent xdg surface via #169's set_window_owner.
+weston_desktop_surface_get_parent() was only declared in internal.h and is
+now exported for shell plugins.
+---
+ include/libweston-desktop/libweston-desktop.h |  2 ++
+ libweston-desktop/surface.c                   |  2 +-
+ rdprail-shell/shell.c                         | 23 +++++++++++++++++--
+ 3 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/include/libweston-desktop/libweston-desktop.h b/include/libweston-desktop/libweston-desktop.h
+index aeb5bc5a..eb9affe1 100644
+--- a/include/libweston-desktop/libweston-desktop.h
++++ b/include/libweston-desktop/libweston-desktop.h
+@@ -200,6 +200,8 @@ struct weston_desktop_client *
+ weston_desktop_surface_get_client(struct weston_desktop_surface *surface);
+ struct weston_surface *
+ weston_desktop_surface_get_surface(struct weston_desktop_surface *surface);
++struct weston_desktop_surface *
++weston_desktop_surface_get_parent(struct weston_desktop_surface *surface);
+ const char *
+ weston_desktop_surface_get_title(struct weston_desktop_surface *surface);
+ const char *
+diff --git a/libweston-desktop/surface.c b/libweston-desktop/surface.c
+index 1894609e..579e1e23 100644
+--- a/libweston-desktop/surface.c
++++ b/libweston-desktop/surface.c
+@@ -701,7 +701,7 @@ weston_desktop_surface_get_implementation_data(struct weston_desktop_surface *su
+ 	return surface->implementation_data;
+ }
+ 
+-struct weston_desktop_surface *
++WL_EXPORT struct weston_desktop_surface *
+ weston_desktop_surface_get_parent(struct weston_desktop_surface *surface)
+ {
+ 	return surface->parent;
+diff --git a/rdprail-shell/shell.c b/rdprail-shell/shell.c
+index 1f293334..9c338320 100644
+--- a/rdprail-shell/shell.c
++++ b/rdprail-shell/shell.c
+@@ -3412,10 +3412,29 @@ desktop_popup_state_changed(struct weston_desktop_surface *desktop_surface,
+ 			    bool mapped, void *data)
+ {
+ 	struct desktop_shell *shell = data;
++	struct weston_surface *surface =
++		weston_desktop_surface_get_surface(desktop_surface);
++
++	/* Keep popups in their parent's RAIL owner tree: Windows raises the
++	 * whole owner tree when it activates an owned window (e.g. the input
++	 * panel owned by the toplevel), so an unowned popup would be covered
++	 * by its own toplevel. */
++	if (mapped && shell->rdprail_api->set_window_owner) {
++		struct weston_desktop_surface *parent =
++			weston_desktop_surface_get_parent(desktop_surface);
++
++		if (parent) {
++			struct weston_surface *owner =
++				weston_surface_get_main_surface(
++					weston_desktop_surface_get_surface(parent));
++
++			if (owner && owner != surface)
++				shell->rdprail_api->set_window_owner(surface, owner);
++		}
++	}
+ 
+ 	if (shell->rdprail_api->notify_popup_state)
+-		shell->rdprail_api->notify_popup_state(
+-			weston_desktop_surface_get_surface(desktop_surface), mapped);
++		shell->rdprail_api->notify_popup_state(surface, mapped);
+ }
+ 
+ static const struct weston_desktop_api shell_desktop_api = {

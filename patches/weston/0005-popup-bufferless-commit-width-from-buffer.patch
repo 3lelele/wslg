@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wslg-patches <patches@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] libweston-desktop: detect bufferless popup commits via
+ width_from_buffer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to #172, which used surface->buffer_ref.buffer to decide whether
+a popup commit carried a buffer (no buffer => unmap, and popup_unmapped is
+sticky). libweston releases buffer_ref after every repaint of an SHM
+surface (weston_output_repaint, backend without keep_buffer), so once the
+popup had been drawn once, any later commit without a fresh attach — JBR's
+frame-callback registration, set_window_geometry, ... — was taken as "no
+buffer". The popup got unmapped, the client never received popup_done, and
+IDEA menus / Ctrl+N dialogs flashed, vanished and kept eating keyboard
+input invisibly (confirmed with WAYLAND_DEBUG, 2026-09-22).
+
+width_from_buffer is only updated on wl_surface.attach and only becomes 0
+on a NULL attach, which is the criterion we actually want.
+---
+ libweston-desktop/surface.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/libweston-desktop/surface.c b/libweston-desktop/surface.c
+index 05971d0b..1894609e 100644
+--- a/libweston-desktop/surface.c
++++ b/libweston-desktop/surface.c
+@@ -286,7 +286,8 @@ weston_desktop_surface_surface_committed(struct wl_listener *listener,
+ 	if (surface->popup) {
+ 		if (surface->popup_dismissed || surface->popup_unmapped)
+ 			return;
+-		if (surface->popup_mapped && !surface->surface->buffer_ref.buffer) {
++		if (surface->popup_mapped &&
++		    surface->surface->width_from_buffer == 0) {
+ 			weston_desktop_surface_unmap_popup(surface);
+ 			return;
+ 		}
+@@ -323,7 +324,7 @@ weston_desktop_surface_surface_committed(struct wl_listener *listener,
+ 	surface->buffer_move.y = 0;
+ 	weston_desktop_surface_update_popup_positions(surface);
+ 	if (surface->popup && !surface->popup_mapped &&
+-	    surface->surface->buffer_ref.buffer) {
++	    surface->surface->width_from_buffer != 0) {
+ 		surface->popup_mapped = true;
+ 		weston_desktop_api_popup_state_changed(surface->desktop,
+ 						 surface, true);
+@@ -578,7 +579,7 @@ weston_desktop_view_propagate_layer(struct weston_desktop_view *view)
+ 
+ 		/* The initial, bufferless xdg commit only requests configure. */
+ 		if (surface && surface->popup &&
+-		    !child->view->surface->buffer_ref.buffer)
++		    child->view->surface->width_from_buffer == 0)
+ 			continue;
+ 
+ 		if (prev == &child->view->layer_link)
