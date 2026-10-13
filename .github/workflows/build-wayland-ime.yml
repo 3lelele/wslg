@@ -1,52 +1,27 @@
 # 在 fork 的 microsoft/wslg 仓库中构建带原生 Wayland 输入法的 system distro
 #
-# 集成的 PR（均来自上游官方仓库，构建时动态 fetch PR ref，fork 本身保持与上游同步、无分叉）：
-#   - wslg         #1486 : config/weston.ini 启用 [input-method] allow-external
-#   - wslg         #1436 : WSLGd 崩溃重启总次数上限（防止持续崩溃进程无限重启）
-#   - wslg         #1333 : XDG_RUNTIME_DIR 权限 0777→0700（安全加固）
-#   - weston-mirror #168 : text-backend 桥接 text-input-v3 <-> input-method-v1
-#   - weston-mirror #169 : rdprail-shell 支持外部输入法候选窗面板
-#   - weston-mirror #166 : rdp-backend 剪贴板 fd 崩溃修复（wslg #1407，IDEA 复制粘贴崩溃）
-#   - weston-mirror #172 : rdp 弹窗定位与窗口同步修复（wslg #1439/#1265/#1299，GTK4 弹窗/子菜单）
+# 与上游的全部差异都已固化在本仓库源码里，构建阶段不再 fetch / merge 任何 PR：
+#   - wslg 侧（已直接合入 main）：
+#       #1486 config/weston.ini 启用 [input-method] allow-external
+#       #1436 WSLGd 崩溃重启总次数上限（防止持续崩溃进程无限重启）
+#       #1333 XDG_RUNTIME_DIR 权限 0777→0700
+#   - weston 侧（patches/weston/ 下的补丁序列，构建时由 apply.sh 套用到固定基线上）：
+#       #168 text-backend 桥接 text-input-v3 <-> input-method-v1
+#       #169 rdprail-shell 支持外部输入法候选窗面板
+#       #166 rdp-backend 剪贴板 fd 崩溃修复（wslg #1407）
+#       #172 rdp 弹窗定位与窗口同步修复（wslg #1439/#1265/#1299）
+#       + 两个本仓库自己的修复（popup 无 buffer 判定、xdg_popup RAIL owner）
+#     基线提交、补丁来源与升级方法见 patches/weston/README.md 与 series.conf。
 #
 # 产物: system_x64.vhd（配合 .wslconfig 的 systemDistro= 使用，随时可回滚官方版）
 #
-# 用法: 将本文件放到 fork 仓库的 .github/workflows/build-wayland-ime.yml，
-#       在 Actions 页面手动 Run workflow。公开仓库 Actions 免费额度不限。
+# 用法: 在 Actions 页面手动 Run workflow。公开仓库 Actions 免费额度不限。
 
 name: Build WSLg system distro with native Wayland IME
 
 on:
   workflow_dispatch:
     inputs:
-      apply_wslg_1486:
-        description: "wslg PR #1486: allow-external input method 配置"
-        type: boolean
-        default: true
-      apply_wslg_1436:
-        description: "wslg PR #1436: 崩溃重启总次数上限（防崩溃循环）"
-        type: boolean
-        default: true
-      apply_wslg_1333:
-        description: "wslg PR #1333: XDG_RUNTIME_DIR 权限 0777→0700（安全加固）"
-        type: boolean
-        default: true
-      apply_weston_168:
-        description: "weston-mirror PR #168: text-input-v3 <-> input-method-v1 桥接"
-        type: boolean
-        default: true
-      apply_weston_169:
-        description: "weston-mirror PR #169: rdprail 外部输入法面板"
-        type: boolean
-        default: true
-      apply_weston_166:
-        description: "weston-mirror PR #166: 剪贴板 fd 崩溃修复（wslg #1407）"
-        type: boolean
-        default: true
-      apply_weston_172:
-        description: "weston-mirror PR #172: 弹窗定位与窗口同步修复（wslg #1439/#1265/#1299）"
-        type: boolean
-        default: true
       debug_build:
         description: "调试构建（含 gdb + debug 符号，排查崩溃用）"
         type: boolean
@@ -55,10 +30,6 @@ on:
 permissions:
   contents: read
   actions: write   # upload-artifact@v4 走 Artifacts API 上传产物必需
-
-env:
-  WSLG_UPSTREAM: https://github.com/microsoft/wslg
-  WESTON_UPSTREAM: https://github.com/microsoft/weston-mirror
 
 jobs:
   build:
@@ -80,44 +51,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: "合并 wslg PR #1486（weston.ini 启用 allow-external）"
-        if: ${{ inputs.apply_wslg_1486 }}
-        run: |
-          set -euo pipefail
-          git config user.name "ci-build"
-          git config user.email "ci@localhost"
-          git fetch "$WSLG_UPSTREAM" pull/1486/head:pr-1486
-          git merge --no-edit pr-1486 || { git merge --abort 2>/dev/null || true; \
-            echo "::error::合并 wslg #1486 失败，可能上游已变更 config/weston.ini，请人工检查冲突"; exit 1; }
-          echo "--- config/weston.ini ---"
-          cat config/weston.ini
-
-      - name: "合并 wslg PR #1436（崩溃重启总次数上限）"
-        if: ${{ inputs.apply_wslg_1436 }}
-        run: |
-          set -euo pipefail
-          git fetch "$WSLG_UPSTREAM" pull/1436/head:pr-1436
-          # 改动仅 WSLGd/ProcessMonitor.cpp：新增 totalCrashes 计数与
-          # c_maxTotalCrashes=50 上限，防止持续崩溃的进程被无限重启（崩溃循环）。
-          # 与 #1486（config/weston.ini）、#1333（WSLGd/main.cpp）文件不重叠，无冲突。
-          git merge --no-edit pr-1436 || { git merge --abort 2>/dev/null || true; \
-            echo "::error::合并 wslg #1436 失败，请人工检查 WSLGd/ProcessMonitor.cpp 冲突"; exit 1; }
-          echo "--- WSLGd/ProcessMonitor.cpp 关键行 ---"
-          grep -n "c_maxTotalCrashes\|totalCrashes" WSLGd/ProcessMonitor.cpp
-
-      - name: "合并 wslg PR #1333（XDG_RUNTIME_DIR 权限 0777→0700）"
-        if: ${{ inputs.apply_wslg_1333 }}
-        run: |
-          set -euo pipefail
-          git fetch "$WSLG_UPSTREAM" pull/1333/head:pr-1333
-          # 改动仅 WSLGd/main.cpp 一行：chmod 0777→0700，收紧运行时目录权限。
-          # 与 #1486/#1436 文件不重叠，无冲突。
-          git merge --no-edit pr-1333 || { git merge --abort 2>/dev/null || true; \
-            echo "::error::合并 wslg #1333 失败，请人工检查 WSLGd/main.cpp 冲突"; exit 1; }
-          echo "--- WSLGd/main.cpp XDG_RUNTIME_DIR 权限 ---"
-          grep -n "chmod(c_xdgRuntimeDir" WSLGd/main.cpp
-
-      - name: 克隆 vendor 源码并配置 weston 合并策略
+      - name: 克隆 vendor 源码
         run: |
           set -euxo pipefail
           mkdir -p vendor
@@ -129,507 +63,15 @@ jobs:
           # DirectX-Headers 与 Mesa 为静态版本声明，不依赖 git describe，浅克隆已实证可过构建
           git clone --depth 1 -b v1.608.0 https://github.com/microsoft/DirectX-Headers.git vendor/DirectX-Headers-1.0
           git clone --depth 1 -b mesa-23.1.0 https://gitlab.freedesktop.org/mesa/mesa.git  vendor/mesa
-          # weston 用 working 分支完整历史（--single-branch 跳过其他分支），保证 PR merge-base 可计算
-          git clone --single-branch -b working "$WESTON_UPSTREAM" vendor/weston
-          # 提前为 weston 仓库配置提交身份与 tests/meson.build 的合并策略。
-          # #168/#169 均在该文件的测试注册区域相邻追加条目，3-way 无法自动合并；
-          # 实证内置 union driver 会碎片化交错两侧插入、损坏 meson 语法（weston 构建期报错），
-          # 故该文件改用自定义 ours 策略（冲突时保持本分支版本），随后由“预构造”步骤
-          # 以行级重放方式生成三侧条目并置的确定性结果并整体覆盖。
-          # 重放基准为两个 PR 的共同 fork 点（而非 working HEAD），
-          # 因此上游 working 分支对 tests/meson.build 的后续改动也会被纳入重放，不会误报。
-          git -C vendor/weston config user.name "ci-build"
-          git -C vendor/weston config user.email "ci@localhost"
-          git -C vendor/weston config merge.ours.driver true
-          mkdir -p vendor/weston/.git/info
-          echo "tests/meson.build merge=ours" >> vendor/weston/.git/info/attributes
           df -h /
 
-      - name: "合并 weston-mirror PR #168（text-input-v3 <-> input-method-v1）"
-        if: ${{ inputs.apply_weston_168 }}
+      - name: 准备 weston（检出固定基线 + 套用 patches/weston/ 补丁序列）
         run: |
           set -euo pipefail
-          cd vendor/weston
-          git fetch origin pull/168/head:pr-168
-          git merge --no-edit pr-168 || { git merge --abort 2>/dev/null || true; \
-            echo "::error::合并 weston #168 失败：上游 working 分支可能已前进，需人工 rebase"; exit 1; }
-          git log --oneline -3
-
-      - name: "预构造 tests/meson.build 的确定性合并结果（#168+#169 双勾时）"
-        if: ${{ inputs.apply_weston_168 && inputs.apply_weston_169 }}
-        run: |
-          set -euo pipefail
-          cd vendor/weston
-          git fetch origin +pull/169/head:pr-169
-          python3 - <<'PY'
-          import subprocess, sys, difflib
-
-          FILE = 'tests/meson.build'
-          BASE, P168, P169 = 'origin/working', 'pr-168', 'pr-169'
-
-          def show(ref):
-              return subprocess.check_output(
-                  ['git', 'show', f'{ref}:{FILE}'], text=True).splitlines(keepends=True)
-
-          def merge_base(a, b):
-              return subprocess.check_output(
-                  ['git', 'merge-base', a, b], text=True).strip()
-
-          W = show(BASE)
-          F168 = merge_base(BASE, P168)
-          F169 = merge_base(BASE, P169)
-          # 两个 PR 必须 fork 自同一提交，否则三路重放基准不确定，转人工
-          if F168 != F169:
-              sys.exit('ERROR: #168/#169 的 fork 点不一致，需人工处理')
-          F = show(F168)
-
-          def ops(a, b):
-              sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
-              return [(i1, i2, b[j1:j2])
-                      for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != 'equal']
-
-          # 以 fork 点为基准，把 working 分支的后续改动也纳入重放（上游前进不再报错），
-          # 三路行级操作按行号并置；同锚点时 working 在前、#168 居中、#169 在后
-          ops_work = ops(F, W)
-          ops168 = ops(F, show(P168))
-          ops169 = ops(F, show(P169))
-          tagged = ([(0, *o) for o in ops_work] +
-                    [(1, *o) for o in ops168] +
-                    [(2, *o) for o in ops169])
-          tagged.sort(key=lambda o: (o[1], o[2], o[0]))
-          out, pos = [], 0
-          for src, i1, i2, lines in tagged:
-              if i1 < pos:
-                  sys.exit('ERROR: working/#168/#169 对 tests/meson.build 的改动区间交叉，需人工处理')
-              out.extend(F[pos:i1])
-              out.extend(lines)
-              pos = i2
-          out.extend(F[pos:])
-          result = ''.join(out)
-
-          need = ['TESTSUITE_TEXT_CONFIG_PATH', 'exe_text_input_method_test',
-                  'TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH',
-                  "'name': 'input-method-bind'",
-                  'TESTSUITE_RDPRAIL_INPUT_PANEL_CONFIG_PATH']
-          missing = [n for n in need if n not in result]
-          if missing:
-              sys.exit(f'ERROR: 预构造结果缺少关键条目: {missing}')
-
-          # 跨 PR 依赖修复：working 分支新增的 rdp-teardown 测试条目中，
-          # plugin_rdp.extract_objects(...) 列表缺 rdprail-window-state.c
-          # （#169 新增文件，定义 rdp_rail_prepare/send_window_state_order，
-          #  合并后 rdprail.c 会调用这两个函数）。
-          # 若缺该文件，链接 test-rdp-teardown 时 undefined reference。
-          # 仅在 rdprail.c 存在且 rdprail-window-state.c 缺失时补入（幂等）。
-          if "'rdprail.c'," in result and "'rdprail-window-state.c'," not in result:
-              result = result.replace(
-                  "'rdprail.c',",
-                  "'rdprail.c',\n\t\t\t'rdprail-window-state.c',",
-                  1,
-              )
-              print('补丁: rdp-teardown extract_objects 已补入 rdprail-window-state.c')
-
-          open('/tmp/tests-meson-final.build', 'w').write(result)
-          print(f'预构造完成: {len(ops_work)} 处 working 改动 + {len(ops168)} 处 #168 改动 + {len(ops169)} 处 #169 改动已按行号并置')
-          PY
-
-      - name: "合并 weston-mirror PR #169（rdprail 外部输入法面板）"
-        if: ${{ inputs.apply_weston_169 }}
-        run: |
-          set -euo pipefail
-          cd vendor/weston
-          git fetch origin +pull/169/head:pr-169
-          if ! git merge --no-edit pr-169; then
-            conflicted=$(git diff --name-only --diff-filter=U)
-            echo "冲突文件: $conflicted"
-            for f in $conflicted; do
-              echo "::error::$f 的冲突无法自动解决（tests/meson.build 已由 ours 策略接管），需人工处理"
-            done
-            exit 1
-          fi
-          # 双 PR 勾选时：以预构造的确定性结果覆盖 tests/meson.build
-          # （ours 策略在 merge 时丢弃了 #169 对该文件的改动，此处按行级重放补回，两侧条目并置且语法完整）
-          if [ "${{ inputs.apply_weston_168 }}" = "true" ] && [ -f /tmp/tests-meson-final.build ]; then
-            cp /tmp/tests-meson-final.build tests/meson.build
-            git add tests/meson.build
-            git commit --no-edit -m "Merge fix: deterministic union of tests/meson.build (weston #168 + #169)"
-          fi
-          # 跨 PR 依赖修复（幂等，双勾时预构造结果已含，不会重复插入）：
-          # working 分支的 rdp-teardown 测试条目中 plugin_rdp.extract_objects(...)
-          # 缺 rdprail-window-state.c（#169 新增文件，定义 rdp_rail_prepare/send_window_state_order，
-          # 合并后 rdprail.c 会调用这两个函数），缺该文件时链接 test-rdp-teardown 会 undefined reference。
-          # 单勾 #169 时预构造步骤不运行，tests/meson.build 保持 working 版本，同样需要此补丁。
-          python3 - <<'PY'
-          s = open('tests/meson.build').read()
-          if "'rdprail.c'," in s and "'rdprail-window-state.c'," not in s:
-              s = s.replace(
-                  "'rdprail.c',",
-                  "'rdprail.c',\n\t\t\t'rdprail-window-state.c',",
-                  1,
-              )
-              open('tests/meson.build', 'w').write(s)
-              print('补丁: rdp-teardown extract_objects 已补入 rdprail-window-state.c')
-          else:
-              print('补丁: rdprail-window-state.c 已存在，跳过')
-          PY
-          git add tests/meson.build
-          git commit --no-edit -m "Fix: add rdprail-window-state.c to rdp-teardown extract_objects" 2>/dev/null || true
-          # 校验 1：不允许残留冲突标记
-          if grep -En '^(<{7} |={7}$|>{7} )' tests/meson.build; then
-            echo "::error::tests/meson.build 仍含冲突标记，需人工处理"
-            exit 1
-          fi
-          # 校验 2：关键测试注册条目必须存在
-          check() { grep -q "$1" tests/meson.build || \
-            { echo "::error::校验失败：tests/meson.build 中缺少 $1，需人工检查"; exit 1; }; }
-          check "TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH"
-          check "'name': 'input-method-bind'"
-          check "TESTSUITE_RDPRAIL_INPUT_PANEL_CONFIG_PATH"
-          if [ "${{ inputs.apply_weston_168 }}" = "true" ]; then
-            check "TESTSUITE_TEXT_CONFIG_PATH"
-            check "exe_text_input_method_test"
-          fi
-          # 校验 3：括号平衡（拦截交错/损坏导致的语法问题）
-          python3 - <<'PY'
-          s = open('tests/meson.build').read()
-          for a, b in (('(', ')'), ('[', ']')):
-              if s.count(a) != s.count(b):
-                  raise SystemExit(f'ERROR: {a}{b} 括号不平衡，构造结果语法损坏，需人工检查')
-          print('括号平衡校验通过')
-          PY
-          echo "tests/meson.build 校验全部通过"
-          git log --oneline -4
-
-      - name: "合并 weston-mirror PR #166（剪贴板 fd 崩溃修复）"
-        if: ${{ inputs.apply_weston_166 }}
-        run: |
-          set -euo pipefail
-          cd vendor/weston
-          git fetch origin +pull/166/head:pr-166
-          if ! git merge --no-edit pr-166; then
-            conflicted=$(git diff --name-only --diff-filter=U)
-            echo "冲突文件: $conflicted"
-            for f in $conflicted; do
-              echo "::error::$f 的冲突无法自动解决，需人工处理"
-            done
-            exit 1
-          fi
-          # 已知问题 1：git ort 合并算法会静默丢弃 #166 对 tests/meson.build 的
-          # rdpclip-fd 测试条目（tests_standalone 数组中间插入 vs 末尾追加的
-          # 三方合并陷阱）。该条目仅注册单元测试，不影响主构建
-          # （rdpclip-fd.c 已通过 libweston/backend-rdp/meson.build 编译进插件），
-          # 但为保持测试覆盖，此处幂等补回。
-          # 已知问题 2（上游 #166 自身 bug）：#166 让 rdpclip.c 调用
-          # rdp_clipboard_take_fd（定义在新增的 rdpclip-fd.c），但
-          # test-rdp-teardown 的 plugin_rdp.extract_objects() 列表没有包含
-          # rdpclip-fd.c，导致链接 test-rdp-teardown 时 undefined reference。
-          # 此处幂等补上。
-          python3 - <<'PY'
-          s = open('tests/meson.build').read()
-          changed = False
-          # 问题 1：补回 rdpclip-fd 测试条目
-          marker = "'rdpclip-fd',"
-          if marker not in s:
-              anchor = "['matrix', [], [ dep_libm, dep_matrix_c ]],"
-              block = "['matrix', [], [ dep_libm, dep_matrix_c ]],\n\t[\n\t\t'rdpclip-fd',\n\t\t['../libweston/backend-rdp/rdpclip-fd.c'],\n\t\t[ dep_zucmain ],\n\t],"
-              if anchor in s:
-                  s = s.replace(anchor, block, 1)
-                  changed = True
-                  print('补丁: rdpclip-fd 测试条目已补回 tests_standalone')
-              else:
-                  print('警告: 未找到 matrix 锚点，rdpclip-fd 测试条目未补回（不影响主构建）')
-          else:
-              print('补丁: rdpclip-fd 测试条目已存在，跳过')
-          # 问题 2：test-rdp-teardown 的 extract_objects 补上 rdpclip-fd.c
-          # 锚点：extract_objects 列表中的 'rdpclip.c', 行（3 个 tab 缩进）
-          if "'rdpclip-fd.c'," not in s:
-              anchor2 = "\t\t\t'rdpclip.c',\n\t\t\t'rdprail.c',"
-              repl2 = "\t\t\t'rdpclip.c',\n\t\t\t'rdpclip-fd.c',\n\t\t\t'rdprail.c',"
-              if anchor2 in s:
-                  s = s.replace(anchor2, repl2, 1)
-                  changed = True
-                  print('补丁: test-rdp-teardown extract_objects 已补上 rdpclip-fd.c')
-              else:
-                  print('警告: 未找到 rdpclip.c/rdprail.c 锚点，extract_objects 未补（可能已存在或结构变化）')
-          else:
-              print('补丁: extract_objects 已含 rdpclip-fd.c，跳过')
-          if changed:
-              open('tests/meson.build', 'w').write(s)
-          PY
-          git add tests/meson.build
-          git commit --no-edit -m "Fix: restore rdpclip-fd test entry + extract_objects for test-rdp-teardown" 2>/dev/null || true
-          git log --oneline -3
-
-      - name: "合并 weston-mirror PR #172（弹窗定位与窗口同步）"
-        if: ${{ inputs.apply_weston_172 }}
-        run: |
-          set -euo pipefail
-          cd vendor/weston
-          git fetch origin +pull/172/head:pr-172
-          # 先尝试合并；#172 与 #169 在 backend-rdp.h 和 rdprail.c 有已知冲突，
-          # 冲突区域逻辑互补，用下面的确定性补丁解决。
-          # 注意：heredoc 不能放在 if 分支内（YAML 剥离缩进后结束标记带缩进，
-          # bash 无法闭合 heredoc），故冲突解决脚本放在 if 分支外无条件运行，
-          # 脚本内部判断是否有冲突标记，无冲突则自动跳过。
-          if ! git merge --no-edit pr-172; then
-            conflicted=$(git diff --name-only --diff-filter=U)
-            echo "冲突文件: $conflicted"
-          fi
-          # 冲突解决（幂等：无冲突标记则跳过）
-          python3 - <<'PY'
-          import sys
-
-          # 冲突标记用 chr() 拼接，避免字面量被 YAML 解析为 merge key
-          M7 = chr(60) * 7   # 7x '<'
-          E7 = chr(61) * 7   # 7x '='
-          G7 = chr(62) * 7   # 7x '>'
-
-          def resolve(path, old, new, desc):
-              with open(path, encoding='utf-8') as f:
-                  s = f.read()
-              if old in s:
-                  s = s.replace(old, new, 1)
-                  with open(path, 'w', encoding='utf-8', newline='') as f:
-                      f.write(s)
-                  print(f'解决: {desc}')
-              elif M7 not in s:
-                  print(f'跳过: {desc}（无冲突标记）')
-              else:
-                  print(f'ERROR: {desc} 冲突块不匹配，需人工处理')
-                  sys.exit(1)
-
-          # 冲突 1：backend-rdp.h —— #169 加 set_window_owner/set_window_visible，
-          # #172 加 notify_popup_state，保留两侧全部回调
-          resolve(
-              'include/libweston/backend-rdp.h',
-              M7 + ' HEAD\n'
-              '\n'
-              '\t/** Set the RAIL owner of a surface.\n'
-              '\t */\n'
-              '\tvoid (*set_window_owner)(struct weston_surface *surface,\n'
-              '\t\t\t\t struct weston_surface *owner);\n'
-              '\n'
-              '\t/** Update the RAIL visibility of a surface.\n'
-              '\t */\n'
-              '\tvoid (*set_window_visible)(struct weston_surface *surface,\n'
-              '\t\t\t\t   bool visible);\n'
-              + E7 + '\n'
-              '\tvoid (*notify_popup_state)(struct weston_surface *surface, bool mapped);\n'
-              + G7 + ' pr-172',
-              '\t/** Set the RAIL owner of a surface.\n'
-              '\t */\n'
-              '\tvoid (*set_window_owner)(struct weston_surface *surface,\n'
-              '\t\t\t\t struct weston_surface *owner);\n'
-              '\n'
-              '\t/** Update the RAIL visibility of a surface.\n'
-              '\t */\n'
-              '\tvoid (*set_window_visible)(struct weston_surface *surface,\n'
-              '\t\t\t\t   bool visible);\n'
-              '\n'
-              '\t/** Notify popup state change.\n'
-              '\t */\n'
-              '\tvoid (*notify_popup_state)(struct weston_surface *surface, bool mapped);',
-              'backend-rdp.h 回调合并',
-          )
-
-          # 冲突 2：rdprail.c —— #169 用 state_fields 位掩码判断 showState 变化，
-          # #172 在 showState 变化时插入 z-order 通知/刷新。
-          # 保留 #169 的条件（更精确），合并 #172 的 z-order 逻辑。
-          resolve(
-              'libweston/backend-rdp/rdprail.c',
-              M7 + ' HEAD\n'
-              '\t\tif (state_fields & WINDOW_ORDER_FIELD_SHOW) {\n'
-              + E7 + '\n'
-              '\t\tif (rail_state->showState != rail_state->showState_requested) {\n'
-              '\t\t\trdp_rail_notify_window_zorder_change(compositor);\n'
-              '\t\t\tif (!rdp_rail_flush_window_zorder(b))\n'
-              '\t\t\t\treturn 0;\n'
-              + G7 + ' pr-172',
-              '\t\tif (state_fields & WINDOW_ORDER_FIELD_SHOW) {\n'
-              '\t\t\trdp_rail_notify_window_zorder_change(compositor);\n'
-              '\t\t\tif (!rdp_rail_flush_window_zorder(b))\n'
-              '\t\t\t\treturn 0;',
-              'rdprail.c showState 冲突合并',
-          )
-          PY
-          # 校验：不允许残留冲突标记
-          if grep -En '^(<{7} |={7}$|>{7} )' include/libweston/backend-rdp.h libweston/backend-rdp/rdprail.c; then
-            echo "::error::冲突解决后仍含冲突标记，需人工处理"
-            exit 1
-          fi
-          # 若合并处于冲突状态，则完成合并提交；否则（无冲突）跳过
-          if git diff --name-only --diff-filter=U | grep -q .; then
-            git add include/libweston/backend-rdp.h libweston/backend-rdp/rdprail.c
-            git commit --no-edit -m "Merge pr-172 with conflict resolution (backend-rdp.h + rdprail.c)"
-          fi
-          # #172 对 tests/meson.build 的改动（文件开头插入 popup-constraint/
-          # window-state-sync 测试条目）被 ours 策略丢弃，此处幂等补回。
-          python3 - <<'PY'
-          s = open('tests/meson.build').read()
-          marker = "foreach name : ['popup-constraint', 'window-state-sync']"
-          if marker not in s:
-              block = "foreach name : ['popup-constraint', 'window-state-sync']\n" \
-                      "\texe = executable('test-' + name, name + '-test.c',\n" \
-                      "\t\tinclude_directories: common_inc, install: false)\n" \
-                      "\ttest(name, exe)\n" \
-                      "endforeach\n\n"
-              s = block + s
-              open('tests/meson.build', 'w').write(s)
-              print('补丁: popup-constraint/window-state-sync 测试条目已补回')
-          else:
-              print('补丁: popup-constraint 已存在，跳过')
-          PY
-          git add tests/meson.build
-          git commit --no-edit -m "Fix: restore popup-constraint/window-state-sync test entries" 2>/dev/null || true
-          # 校验：关键条目存在 + 括号平衡
-          check() { grep -q "$1" tests/meson.build || \
-            { echo "::error::校验失败：tests/meson.build 中缺少 $1，需人工检查"; exit 1; }; }
-          check "popup-constraint"
-          check "window-state-sync"
-          python3 - <<'PY'
-          s = open('tests/meson.build').read()
-          for a, b in (('(', ')'), ('[', ']')):
-              if s.count(a) != s.count(b):
-                  raise SystemExit(f'ERROR: {a}{b} 括号不平衡，需人工检查')
-          print('括号平衡校验通过')
-          PY
-          echo "tests/meson.build 校验全部通过"
-          git log --oneline -4
-
-      - name: "修复 weston #172：popup 无 buffer 判定改用 width_from_buffer（IDEA 弹窗闪退根因）"
-        if: ${{ inputs.apply_weston_172 }}
-        run: |
-          set -euo pipefail
-          cd vendor/weston
-          # #172 在 libweston-desktop/surface.c 用 surface->buffer_ref.buffer 判断"popup 提交时没有
-          # buffer"（无 buffer 即 unmap，且 popup_unmapped 置位后永不再映射）。但 libweston 在每次
-          # 重绘之后就会释放 SHM 表面的 buffer_ref（libweston/compositor.c weston_output_repaint：
-          # 后端未设置 keep_buffer 时 weston_buffer_reference(&buffer_ref, NULL)），所以 popup 只要被
-          # 绘制过一次，之后任何不带新 attach 的 commit（JBR 的 frame 回调注册、set_window_geometry 等）
-          # 都会被误判为"无 buffer"而被 unmap，客户端收不到 popup_done——这就是 IDEA 菜单 / Ctrl+N
-          # 弹窗"闪一下就消失、之后隐形吃键盘"的根因（2026-09-22 用 WAYLAND_DEBUG 实证）。
-          # width_from_buffer 只在 wl_surface.attach 时更新，只有 NULL attach 才归零，是正确判据。
-          python3 - <<'PY'
-          import sys
-          p = 'libweston-desktop/surface.c'
-          s = open(p).read()
-          reps = [
-              ("\t\tif (surface->popup_mapped && !surface->surface->buffer_ref.buffer) {",
-               "\t\tif (surface->popup_mapped &&\n\t\t    surface->surface->width_from_buffer == 0) {"),
-              ("\tif (surface->popup && !surface->popup_mapped &&\n\t    surface->surface->buffer_ref.buffer) {",
-               "\tif (surface->popup && !surface->popup_mapped &&\n\t    surface->surface->width_from_buffer != 0) {"),
-              ("\t\tif (surface && surface->popup &&\n\t\t    !child->view->surface->buffer_ref.buffer)\n\t\t\tcontinue;",
-               "\t\tif (surface && surface->popup &&\n\t\t    child->view->surface->width_from_buffer == 0)\n\t\t\tcontinue;"),
-          ]
-          for old, new in reps:
-              if old not in s:
-                  sys.exit('ERROR: 未找到 #172 目标代码（PR 可能已更新），需人工检查:\n' + old)
-              s = s.replace(old, new, 1)
-          open(p, 'w').write(s)
-          print('补丁: surface.c 三处 buffer_ref 判定已改为 width_from_buffer')
-          PY
-          # 校验：working 分支原版 surface.c 不含 buffer_ref，#172 引入的三处应全部被替换
-          if grep -n "buffer_ref" libweston-desktop/surface.c; then
-            echo "::error::surface.c 仍残留 buffer_ref 判定，需人工检查"
-            exit 1
-          fi
-          grep -n "width_from_buffer" libweston-desktop/surface.c
-          git add libweston-desktop/surface.c
-          git commit --no-edit -m "Fix #172: detect bufferless popup commits via width_from_buffer, not buffer_ref (libweston releases buffer_ref after repaint)"
-          git log --oneline -3
-
-      - name: "修复 #169+#172 组合：xdg_popup 的 RAIL owner 设为父窗口（候选框弹出时搜索框被主窗口盖住）"
-        if: ${{ inputs.apply_weston_169 && inputs.apply_weston_172 }}
-        run: |
-          set -euo pipefail
-          cd vendor/weston
-          # 现象（2026-09-22 实证）：Ctrl+N 弹窗在 fcitx5 候选框出现的瞬间"消失"，候选框关闭、
-          # weston 重发 Z 序后又出现。weston 侧 Z 序与 view 全程正确，问题在 Windows 侧：
-          # #169 把输入面板的 RAIL owner 设为 text_input 所在主窗口（JBR 的 text-input 绑定在
-          # toplevel 上），而 xdg_popup 的 RAIL 窗口没有 owner（rdprail.c 只对 wl_subsurface 设
-          # parent）。Windows 激活一个 owned 窗口时会把整棵 owner 树（主窗口+候选框）提到最前，
-          # 无 owner 的 popup 就被压到主窗口后面。修法：popup 映射时（#172 新增的
-          # popup_state_changed 回调）用 #169 的 set_window_owner 把 owner 设为父 xdg surface。
-          # weston_desktop_surface_get_parent() 只在 internal.h 声明，需导出给 shell 插件使用。
-          python3 - <<'PY'
-          import sys
-
-          def patch(path, old, new, desc):
-              s = open(path).read()
-              if old not in s:
-                  sys.exit('ERROR: %s 目标代码未找到（上游/PR 可能已更新），需人工检查:\n%s' % (desc, old))
-              open(path, 'w').write(s.replace(old, new, 1))
-              print('补丁: ' + desc)
-
-          patch('libweston-desktop/surface.c',
-                "struct weston_desktop_surface *\n"
-                "weston_desktop_surface_get_parent(struct weston_desktop_surface *surface)\n"
-                "{\n"
-                "\treturn surface->parent;\n"
-                "}\n",
-                "WL_EXPORT struct weston_desktop_surface *\n"
-                "weston_desktop_surface_get_parent(struct weston_desktop_surface *surface)\n"
-                "{\n"
-                "\treturn surface->parent;\n"
-                "}\n",
-                'surface.c 导出 weston_desktop_surface_get_parent')
-
-          patch('include/libweston-desktop/libweston-desktop.h',
-                "struct weston_surface *\n"
-                "weston_desktop_surface_get_surface(struct weston_desktop_surface *surface);\n",
-                "struct weston_surface *\n"
-                "weston_desktop_surface_get_surface(struct weston_desktop_surface *surface);\n"
-                "struct weston_desktop_surface *\n"
-                "weston_desktop_surface_get_parent(struct weston_desktop_surface *surface);\n",
-                'libweston-desktop.h 声明 weston_desktop_surface_get_parent')
-
-          patch('rdprail-shell/shell.c',
-                "static void\n"
-                "desktop_popup_state_changed(struct weston_desktop_surface *desktop_surface,\n"
-                "\t\t\t    bool mapped, void *data)\n"
-                "{\n"
-                "\tstruct desktop_shell *shell = data;\n"
-                "\n"
-                "\tif (shell->rdprail_api->notify_popup_state)\n"
-                "\t\tshell->rdprail_api->notify_popup_state(\n"
-                "\t\t\tweston_desktop_surface_get_surface(desktop_surface), mapped);\n"
-                "}\n",
-                "static void\n"
-                "desktop_popup_state_changed(struct weston_desktop_surface *desktop_surface,\n"
-                "\t\t\t    bool mapped, void *data)\n"
-                "{\n"
-                "\tstruct desktop_shell *shell = data;\n"
-                "\tstruct weston_surface *surface =\n"
-                "\t\tweston_desktop_surface_get_surface(desktop_surface);\n"
-                "\n"
-                "\t/* Keep popups in their parent's RAIL owner tree: Windows raises the\n"
-                "\t * whole owner tree when it activates an owned window (e.g. the input\n"
-                "\t * panel owned by the toplevel), so an unowned popup would be covered\n"
-                "\t * by its own toplevel. */\n"
-                "\tif (mapped && shell->rdprail_api->set_window_owner) {\n"
-                "\t\tstruct weston_desktop_surface *parent =\n"
-                "\t\t\tweston_desktop_surface_get_parent(desktop_surface);\n"
-                "\n"
-                "\t\tif (parent) {\n"
-                "\t\t\tstruct weston_surface *owner =\n"
-                "\t\t\t\tweston_surface_get_main_surface(\n"
-                "\t\t\t\t\tweston_desktop_surface_get_surface(parent));\n"
-                "\n"
-                "\t\t\tif (owner && owner != surface)\n"
-                "\t\t\t\tshell->rdprail_api->set_window_owner(surface, owner);\n"
-                "\t\t}\n"
-                "\t}\n"
-                "\n"
-                "\tif (shell->rdprail_api->notify_popup_state)\n"
-                "\t\tshell->rdprail_api->notify_popup_state(surface, mapped);\n"
-                "}\n",
-                'shell.c popup 映射时设置 RAIL owner')
-          PY
-          grep -n "weston_desktop_surface_get_parent" include/libweston-desktop/libweston-desktop.h libweston-desktop/surface.c rdprail-shell/shell.c
-          grep -n "set_window_owner" rdprail-shell/shell.c include/libweston/backend-rdp.h
-          git add include/libweston-desktop/libweston-desktop.h libweston-desktop/surface.c rdprail-shell/shell.c
-          git commit --no-edit -m "rdprail-shell: give xdg_popup RAIL windows their parent as owner (keeps popups above toplevel when the input panel is activated)"
-          git log --oneline -3
+          ./patches/weston/apply.sh
+          echo "--- vendor/weston 状态 ---"
+          git -C vendor/weston log --oneline -1
+          git -C vendor/weston diff --cached --stat | tail -1
 
       - name: 构建 system distro VHD（release）
         if: ${{ inputs.debug_build != true }}
@@ -661,14 +103,15 @@ jobs:
         run: |
           set -euo pipefail
           sha256sum system_x64.vhd > system_x64.vhd.sha256
+          . patches/weston/series.conf
           {
             echo "### 构建产物信息"
             echo ""
             echo "| 项目 | 值 |"
             echo "|---|---|"
-            echo "| wslg 基线 commit | \`$(git rev-parse HEAD)\` |"
-            echo "| weston 合并后 commit | \`$(git -C vendor/weston rev-parse HEAD)\` |"
-            echo "| 集成 PR | wslg#1486 / wslg#1436 / wslg#1333 / weston#168 / weston#169 / weston#166 / weston#172（按勾选项） |"
+            echo "| wslg commit | \`$(git rev-parse HEAD)\` |"
+            echo "| weston 基线 commit | \`$WESTON_BASE\` |"
+            echo "| weston 补丁 | $(ls patches/weston/*.patch | xargs -n1 basename | sed 's/\.patch$//' | paste -sd ' ') |"
             echo "| debug 构建 | ${{ inputs.debug_build }} |"
             echo "| VHD 大小 | $(du -h system_x64.vhd | cut -f1) |"
             echo "| SHA-256 | \`$(cut -d' ' -f1 system_x64.vhd.sha256)\` |"
