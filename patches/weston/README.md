@@ -21,6 +21,7 @@ wslg 侧那样直接合进本仓库源码。这里用的是等价做法：**固�
 | 0004 | [weston-mirror #172](https://github.com/microsoft/weston-mirror/pull/172) | rdp 弹窗定位与窗口状态同步（wslg #1439/#1265/#1299，GTK4 弹窗/子菜单） |
 | 0005 | 本仓库 | #172 的后续修复：popup 无 buffer 判定改用 `width_from_buffer`（IDEA 弹窗闪退根因） |
 | 0006 | 本仓库 | #169+#172 组合问题：xdg_popup 的 RAIL owner 设为父窗口（候选框弹出时搜索框被主窗口盖住） |
+| 0007 | 本仓库 | rdp-backend 剪贴板：Windows 侧数据响应改在 compositor 线程注册 fd。修复复制后 weston 在 `wl_event_source_remove(NULL)` 段错误、整个 WSLg 会话消失的问题（#166 之后仍会出现，是跨线程竞态） |
 
 0002–0004 还各自带了让它们能一起编译的集成修复（`tests/meson.build` 条目并置、
 `extract_objects` 补文件、#169/#172 的冲突解决），具体见各补丁的描述。

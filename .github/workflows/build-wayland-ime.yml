@@ -10,7 +10,8 @@
 #       #169 rdprail-shell 支持外部输入法候选窗面板
 #       #166 rdp-backend 剪贴板 fd 崩溃修复（wslg #1407）
 #       #172 rdp 弹窗定位与窗口同步修复（wslg #1439/#1265/#1299）
-#       + 两个本仓库自己的修复（popup 无 buffer 判定、xdg_popup RAIL owner）
+#       + 三个本仓库自己的修复（popup 无 buffer 判定、xdg_popup RAIL owner、
+#         剪贴板响应改在 compositor 线程注册 fd —— 复制后 weston 段错误）
 #     基线提交、补丁来源与升级方法见 patches/weston/README.md 与 series.conf。
 #
 # 产物: system_x64.vhd（配合 .wslconfig 的 systemDistro= 使用，随时可回滚官方版）

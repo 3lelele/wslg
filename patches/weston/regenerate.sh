@@ -13,7 +13,7 @@
 #   1. 克隆/更新 weston-mirror，fetch 各 PR 的 head
 #   2. 在 WESTON_BASE 上按固定顺序 merge 各 PR，并执行跨 PR 的冲突解决与
 #      tests/meson.build 修补（逻辑源自旧版 build-wayland-ime.yml，已实证可构建）
-#   3. 把合并结果拆成线性的 6 个补丁，写回本目录（覆盖旧 *.patch）
+#   3. 把合并结果拆成线性的 7 个补丁，写回本目录（覆盖旧 *.patch）
 #   4. 把套用后的 tree hash 写回 series.conf 的 EXPECTED_TREE
 #
 # 文本修补一律通过 load()/save() 保留文件原有行尾：weston 里 rdprail.c、
@@ -346,6 +346,207 @@ git add include/libweston-desktop/libweston-desktop.h libweston-desktop/surface.
 git commit -q --no-edit -m "rdprail-shell: give xdg_popup RAIL windows their parent as owner"
 git tag -f state-6 >/dev/null
 
+# ------------------- rdpclip: 剪贴板数据响应改在 compositor 线程注册 fd（见 0007 补丁说明）
+log "patch: rdpclip data response on compositor thread"
+python3 - <<PY
+import sys
+$PYHELPERS
+def patch(path, old, new):
+    s, crlf = load(path)
+    if old not in s:
+        sys.exit('ERROR: %s 中找不到目标代码（上游/PR 可能已更新）:\n%s' % (path, old))
+    save(path, s.replace(old, new, 1), crlf)
+
+# clipboard_data_source_write(): 显式断言 event source 已设置；对端已关闭管道时直接放弃
+patch('libweston/backend-rdp/rdpclip.c',
+      "\tassert(source->data_source_fd == fd);\n"
+      "\t/* this data source must be tracked as inflight */\n"
+      "\tassert(source == ctx->clipboard_inflight_client_data_source);\n"
+      "\n"
+      "\tif (source->is_canceled) {\n",
+      "\tassert(source->data_source_fd == fd);\n"
+      "\t/* this data source must be tracked as inflight */\n"
+      "\tassert(source == ctx->clipboard_inflight_client_data_source);\n"
+      "\t/* the event source is always registered from the compositor thread, so it\n"
+      "\t   is set before this callback can possibly run; it's removed below. */\n"
+      "\tassert(source->transfer_event_source);\n"
+      "\n"
+      "\tif (source->is_canceled) {\n")
+
+patch('libweston/backend-rdp/rdpclip.c',
+      "\t\tgoto fail;\n"
+      "\t}\n"
+      "\n"
+      "\tif (!source->data_contents.data || !source->data_contents.size) {\n",
+      "\t\tgoto fail;\n"
+      "\t}\n"
+      "\n"
+      "\tif (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP)) {\n"
+      "\t\t/* The requesting application already closed its end of the pipe,\n"
+      "\t\t   e.g. the clipboard manager drops its pipe as soon as another\n"
+      "\t\t   selection comes in while our request to the client is still\n"
+      "\t\t   outstanding. write() could only fail with EPIPE (and raise\n"
+      "\t\t   SIGPIPE), so give up right away. */\n"
+      "\t\tsource->state = RDP_CLIPBOARD_SOURCE_FAILED;\n"
+      "\t\tweston_log(\"RDP %s (%p:%s) requester closed the pipe, mask:0x%x\\\\n\",\n"
+      "\t\t\t   __func__, source,\n"
+      "\t\t\t   clipboard_data_source_state_to_string(source), mask);\n"
+      "\t\tgoto fail;\n"
+      "\t}\n"
+      "\n"
+      "\tif (!source->data_contents.data || !source->data_contents.size) {\n")
+
+# 新增 compositor 线程任务 clipboard_data_source_received()，接在 _write() 之后
+patch('libweston/backend-rdp/rdpclip.c',
+      "\tctx->clipboard_inflight_client_data_source = NULL;\n"
+      "\tclipboard_data_source_unref(source);\n"
+      "\n"
+      "\treturn 0;\n"
+      "}\n",
+      "\tctx->clipboard_inflight_client_data_source = NULL;\n"
+      "\tclipboard_data_source_unref(source);\n"
+      "\n"
+      "\treturn 0;\n"
+      "}\n"
+      "\n"
+      "/* client's reply with data for data request, start sending it to the\n"
+      " * requesting application at server side */\n"
+      "static void\n"
+      "clipboard_data_source_received(bool freeOnly, void *arg)\n"
+      "{\n"
+      "\tstruct rdp_clipboard_data_source *source = wl_container_of(arg, source, task_base);\n"
+      "\tfreerdp_peer *client = (freerdp_peer *)source->context;\n"
+      "\tRdpPeerContext *ctx = (RdpPeerContext *)client->context;\n"
+      "\tstruct rdp_backend *b = ctx->rdpBackend;\n"
+      "\tstruct wl_event_loop *loop = wl_display_get_event_loop(b->compositor->wl_display);\n"
+      "\n"
+      "\trdp_debug_clipboard(b, \"RDP %s (%p:%s) fd:%d\\\\n\", __func__,\n"
+      "\t\t\t    source,\n"
+      "\t\t\t    clipboard_data_source_state_to_string(source),\n"
+      "\t\t\t    source->data_source_fd);\n"
+      "\n"
+      "\tassert_compositor_thread(b);\n"
+      "\n"
+      "\t/* this data source must be tracked as inflight */\n"
+      "\tassert(source == ctx->clipboard_inflight_client_data_source);\n"
+      "\t/* transfer event source must not be set */\n"
+      "\tassert(source->transfer_event_source == NULL);\n"
+      "\t/* data has not been sent to write() yet, thus must be no inflight write. */\n"
+      "\tassert(source->inflight_write_count == 0);\n"
+      "\tassert(source->inflight_data_to_write == NULL);\n"
+      "\tassert(source->inflight_data_size == 0);\n"
+      "\n"
+      "\tif (freeOnly) {\n"
+      "\t\t/* peer context is going away, data is never going to be sent. */\n"
+      "\t\tsource->state = RDP_CLIPBOARD_SOURCE_FAILED;\n"
+      "\t\tgoto error_exit;\n"
+      "\t}\n"
+      "\n"
+      "\t/* The event source must be added from the compositor thread: epoll\n"
+      "\t * reports EPOLLERR/EPOLLHUP regardless of the requested mask, so if the\n"
+      "\t * requesting application already closed its end of the pipe the write\n"
+      "\t * callback runs as soon as the fd is registered, and it expects\n"
+      "\t * transfer_event_source to be set by then. Registering from the\n"
+      "\t * FreeRDP thread let the callback race with that store and call\n"
+      "\t * wl_event_source_remove(NULL). */\n"
+      "\tif (rdp_event_loop_add_fd(loop, source->data_source_fd, WL_EVENT_WRITABLE,\n"
+      "\t\t\t\t  clipboard_data_source_write, source,\n"
+      "\t\t\t\t  &source->transfer_event_source))\n"
+      "\t\treturn;\n"
+      "\n"
+      "\tsource->state = RDP_CLIPBOARD_SOURCE_FAILED;\n"
+      "\tweston_log(\"RDP %s (%p:%s) rdp_event_loop_add_fd failed\\\\n\",\n"
+      "\t\t   __func__, source,\n"
+      "\t\t   clipboard_data_source_state_to_string(source));\n"
+      "\n"
+      "error_exit:\n"
+      "\t/* close fd to let the requesting application know there is no data. */\n"
+      "\tclose(source->data_source_fd);\n"
+      "\tsource->data_source_fd = -1;\n"
+      "\t/* clear inflight data source from client to server. */\n"
+      "\tctx->clipboard_inflight_client_data_source = NULL;\n"
+      "\tclipboard_data_source_unref(source);\n"
+      "}\n")
+
+# clipboard_client_format_data_response()（FreeRDP 线程）：不再直接注册 fd，改为派发任务
+patch('libweston/backend-rdp/rdpclip.c',
+      "\tstruct wl_event_loop *loop = wl_display_get_event_loop(b->compositor->wl_display);\n"
+      "\tstruct rdp_clipboard_data_source *source = ctx->clipboard_inflight_client_data_source;\n"
+      "\tbool success = false;\n"
+      "\tbool ret;\n",
+      "\tstruct rdp_clipboard_data_source *source = ctx->clipboard_inflight_client_data_source;\n"
+      "\tbool success = false;\n")
+
+patch('libweston/backend-rdp/rdpclip.c',
+      "\tif (source->transfer_event_source || (source->inflight_write_count != 0)) {\n"
+      "\t\t/* here means client responded more than once for single data request */\n"
+      "\t\tsource->state = RDP_CLIPBOARD_SOURCE_FAILED;\n"
+      "\t\tweston_log(\"Client: %s (%p:%s) middle of write loop:%p, %d\\\\n\",\n"
+      "\t\t\t   __func__, source, clipboard_data_source_state_to_string(source),\n"
+      "\t\t\t   source->transfer_event_source, source->inflight_write_count);\n"
+      "\t\treturn -1;\n"
+      "\t}\n",
+      "\t/* A response is only expected while the request is outstanding (or\n"
+      "\t   canceled while outstanding). Anything else means the client responded\n"
+      "\t   more than once for a single data request: either the previous response\n"
+      "\t   is still queued for the compositor thread, or it's already being\n"
+      "\t   written to the requesting application. */\n"
+      "\tif (source->transfer_event_source || (source->inflight_write_count != 0) ||\n"
+      "\t    (source->state != RDP_CLIPBOARD_SOURCE_REQUEST_DATA &&\n"
+      "\t     source->state != RDP_CLIPBOARD_SOURCE_CANCEL_PENDING)) {\n"
+      "\t\tweston_log(\"Client: %s (%p:%s) unexpected response, middle of write loop:%p, %d\\\\n\",\n"
+      "\t\t\t   __func__, source, clipboard_data_source_state_to_string(source),\n"
+      "\t\t\t   source->transfer_event_source, source->inflight_write_count);\n"
+      "\t\tsource->state = RDP_CLIPBOARD_SOURCE_FAILED;\n"
+      "\t\treturn -1;\n"
+      "\t}\n")
+
+patch('libweston/backend-rdp/rdpclip.c',
+      "\tassert(source->transfer_event_source == NULL);\n"
+      "\tif (success) {\n"
+      "\t\tret = rdp_event_loop_add_fd(loop, source->data_source_fd, WL_EVENT_WRITABLE,\n"
+      "\t\t\t\t\t    clipboard_data_source_write,\n"
+      "\t\t\t\t\t    source, &source->transfer_event_source);\n"
+      "\t\tif (!ret) {\n"
+      "\t\t\tsource->state = RDP_CLIPBOARD_SOURCE_FAILED;\n"
+      "\t\t\tweston_log(\"Client: %s (%p:%s) rdp_event_loop_add_fd failed\\\\n\",\n"
+      "\t\t\t\t   __func__, source, clipboard_data_source_state_to_string(source));\n"
+      "\t\t\treturn -1;\n"
+      "\t\t}\n"
+      "\t} else {\n"
+      "\t\trdp_dispatch_task_to_display_loop(ctx, clipboard_data_source_fail, &source->task_base);\n"
+      "\t}\n",
+      "\tassert(source->transfer_event_source == NULL);\n"
+      "\t/* Hand over to the compositor thread in both cases. The event loop is\n"
+      "\t   not thread safe, and in particular the fd must not be registered from\n"
+      "\t   here: see clipboard_data_source_received(). */\n"
+      "\trdp_dispatch_task_to_display_loop(ctx,\n"
+      "\t\t\t\t\t  success ? clipboard_data_source_received\n"
+      "\t\t\t\t\t\t  : clipboard_data_source_fail,\n"
+      "\t\t\t\t\t  &source->task_base);\n")
+
+# rdp_event_loop_add_fd(): 写明只能在 compositor 线程调用及原因
+patch('libweston/backend-rdp/rdputil.c',
+      "bool\n"
+      "rdp_event_loop_add_fd(struct wl_event_loop *loop, int fd, uint32_t mask, wl_event_loop_fd_func_t func, void *data, struct wl_event_source **event_source)\n"
+      "{\n",
+      "/* Must be called from the compositor (display loop) thread only.\n"
+      " *\n"
+      " * The fd is registered with an empty mask first so that *event_source is\n"
+      " * already stored when the mask is enabled and the callback can fire. That\n"
+      " * only holds on the thread running the loop: epoll reports EPOLLERR/EPOLLHUP\n"
+      " * regardless of the mask, so from any other thread the callback could run\n"
+      " * between wl_event_loop_add_fd() and the store. FreeRDP thread code must go\n"
+      " * through rdp_dispatch_task_to_display_loop() instead. */\n"
+      "bool\n"
+      "rdp_event_loop_add_fd(struct wl_event_loop *loop, int fd, uint32_t mask, wl_event_loop_fd_func_t func, void *data, struct wl_event_source **event_source)\n"
+      "{\n")
+PY
+grep -q "clipboard_data_source_received" libweston/backend-rdp/rdpclip.c || die "rdpclip.c 缺少 clipboard_data_source_received"
+git add libweston/backend-rdp/rdpclip.c libweston/backend-rdp/rdputil.c
+git commit -q --no-edit -m "rdp-backend: register clipboard response fd on the compositor thread"
+git tag -f state-7 >/dev/null
+
 # ------------------------------------------------------------------ 校验合并结果
 log "校验合并结果"
 for m in TESTSUITE_TEXT_CONFIG_PATH exe_text_input_method_test TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH \
@@ -359,8 +560,8 @@ for a, b in (('(', ')'), ('[', ']')):
     if s.count(a) != s.count(b):
         raise SystemExit(f'ERROR: tests/meson.build 的 {a}{b} 不平衡')
 PY
-for f in $(git diff --name-only state-0 state-6); do
-  if git show "state-6:$f" | grep -qE '^(<{7} |>{7} )'; then die "$f 含冲突标记"; fi
+for f in $(git diff --name-only state-0 state-7); do
+  if git show "state-7:$f" | grep -qE '^(<{7} |>{7} )'; then die "$f 含冲突标记"; fi
 done
 
 # ---------------------------------------------- 拆成线性补丁序列并写回本目录
@@ -479,6 +680,46 @@ Fix: when a popup is mapped (popup_state_changed hook from #172), set its
 RAIL owner to its parent xdg surface via #169's set_window_owner.
 weston_desktop_surface_get_parent() was only declared in internal.h and is
 now exported for shell plugins.
+EOF
+
+stage state-6 state-7 0007-rdpclip-data-response-on-compositor-thread <<'EOF'
+rdp-backend: register clipboard response fd on the compositor thread
+
+Fixes the intermittent weston SIGSEGV in wl_event_source_remove() (RDI=0,
+"segfault at 28 ... in libwayland-server.so") seen after copying in a
+Wayland client such as IntelliJ IDEA, which took the whole WSLg session
+down. It still occurred with #166 (patch 0003) applied.
+
+clipboard_client_format_data_response() runs on the FreeRDP thread. When
+the Windows side answered a data request it called rdp_event_loop_add_fd()
+right there, i.e. registered the requester's pipe fd in the compositor's
+wl_event_loop from the wrong thread. epoll reports EPOLLERR/EPOLLHUP no
+matter which mask was requested, so if the requesting application had
+already closed its read end the compositor thread woke up inside the
+epoll_ctl(ADD) and ran clipboard_data_source_write() before the FreeRDP
+thread had stored the new wl_event_source into transfer_event_source; the
+callback then called wl_event_source_remove(NULL).
+
+"Reader already gone" is the normal case, not a corner case: libweston's
+clipboard manager requests the data of every new selection through a pipe
+and unrefs (closes) that pipe as soon as the next selection arrives, and
+with WSLg the next selection arrives all the time -- the Windows side
+re-publishes a Linux copy about a second later (twice, ~15 ms apart), and
+fcitx5's X11 clipboard monitor requests every selection too. Each of those
+left a Windows data request outstanding on a pipe nobody reads any more,
+and every response to it entered the race; whether it crashed depended on
+the scheduler preempting the FreeRDP thread at syscall exit.
+
+Fix: the response handler only caches the data (the PDU buffer is only
+valid during the callback) and hands over to the compositor thread with
+rdp_dispatch_task_to_display_loop(), like the failure path already did.
+The new clipboard_data_source_received() task registers the fd there, so
+transfer_event_source is always set before the write callback can run.
+clipboard_data_source_write() now also gives up straight away when the fd
+is reported with WL_EVENT_ERROR/HANGUP instead of write()ing into a pipe
+without readers (EPIPE + SIGPIPE, which weston does not ignore), and the
+duplicate-response check covers a response that is still queued for the
+compositor thread.
 EOF
 
 tree=$(git rev-parse 'HEAD^{tree}')

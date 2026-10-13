@@ -38,6 +38,7 @@ weston 不在本仓库里（`vendor/` 被 gitignore，构建时克隆），所�
 | 0004 | [weston-mirror#172](https://github.com/microsoft/weston-mirror/pull/172) | rdp 弹窗定位与窗口状态同步（wslg#1439/#1265/#1299） |
 | 0005 | 本 fork 原创 | #172 后续修复：popup "无 buffer"判定改用 `width_from_buffer`（IDEA 菜单/Ctrl+N 弹窗闪退的根因） |
 | 0006 | 本 fork 原创 | #169+#172 组合问题：xdg_popup 的 RAIL owner 设为父窗口（候选框出现时 popup 被主窗口盖住） |
+| 0007 | 本 fork 原创 | rdp-backend 剪贴板：Windows 侧数据响应改在 compositor 线程注册 fd。修复"复制后 weston 段错误、整个 WSLg 会话消失"（#166 之后仍会出现的跨线程竞态，见 §4.1） |
 
 0002–0004 各自还带着让它们能一起编译的集成修复（`tests/meson.build` 条目并置、
 `extract_objects` 补文件、#169/#172 在 `backend-rdp.h`/`rdprail.c` 的冲突解决）。
@@ -92,6 +93,34 @@ wslg 侧三个 PR 真实 merge 进 `main`；weston 侧按旧 workflow 的顺序�
 **未做的事**：没有在本地跑完整 Docker 构建（Mesa 等编译耗时数小时）。补丁内容与此前多次
 CI 构建成功的内容一致（见第 3 条），但新 workflow 本身还需要在 Actions 上 **Run workflow**
 实际验证一次。
+
+### 4.1 同日第二轮：复制后 weston 段错误（补丁 0007）
+
+现象：在 IDEA（原生 Wayland 模式）里复制之后，偶尔整个 WSLg 界面消失，`dmesg` 里是
+`weston[...]: segfault at 28 ... in libwayland-server.so.0.22.0`，IDEA 日志只有
+`WLToolkit - Wayland protocol I/O error`。已部署的 VHD（2026-09-22 构建）里已经含 #166，
+即 wslg#1407 的修复**没有**覆盖这个崩溃。
+
+定位方法：用 `debugfs` 直接从 `system_x64.vhd` 取出 `libwayland-server.so.0.22.0`，
+`objdump` 到 dmesg 给出的文件偏移 `0xbdad`，指令字节与 dmesg 的 `Code:` 完全一致，落在
+`wl_event_source_remove()` 第一条指令 `mov 0x28(%rdi),%edx`（读 `source->fd`），
+`RDI=0` → weston 以 NULL 调用了 `wl_event_source_remove()`。weston 里所有未判空的调用点中，
+只有 `rdpclip.c` 的 `clipboard_data_source_write()` 能被另一个线程抢先触发：
+`clipboard_client_format_data_response()` 在 **FreeRDP 线程**上直接
+`rdp_event_loop_add_fd()`，而 epoll 不管请求的 mask 是什么都会上报 `EPOLLERR/EPOLLHUP`，
+请求方的管道读端若已经关闭（libweston 的 clipboard manager 在下一个 selection 到来时就会关掉它；
+WSLg 里 Windows 会在 Linux 复制后约 1 秒把同样内容再推回来两次，所以这是常态），compositor
+线程在 `epoll_ctl(ADD)` 内就被唤醒并跑进 `clipboard_data_source_write()`，此时
+`transfer_event_source` 还没被 FreeRDP 线程写入 → `wl_event_source_remove(NULL)`。
+是否崩溃取决于 FreeRDP 线程是否恰好在系统调用返回处被抢占，所以"有时候"。上游 weston
+的同一段代码至今相同。
+
+修复（0007）：响应回调只缓存数据，然后像失败路径一样 `rdp_dispatch_task_to_display_loop()`
+交给 compositor 线程，由新增的 `clipboard_data_source_received()` 在那里注册 fd；
+`clipboard_data_source_write()` 收到 `WL_EVENT_ERROR/HANGUP` 时直接放弃而不 `write()`
+（weston 没忽略 SIGPIPE）；重复响应的判定覆盖"上一个响应还排在队列里"的情况。
+`regenerate.sh` 增加了 state-7 步骤，`EXPECTED_TREE` 已更新。本地同样没有编译
+（改动只用了同文件里已有的调用模式），需要 Actions 构建后替换 VHD 验证。
 
 ## 5. 维护指南
 
