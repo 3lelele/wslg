@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wslg-patches <patches@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] rdprail-shell: ignore desktop work areas that do not cover
+ the output
+
+Fixes misplaced context menus and other popups after a display topology
+change. With an external 4K monitor powered off and on again, weston.log
+shows the client sending three work areas in the same moment:
+
+  [14:02:07.383] workArea (0,0)-(3840,2112) at rdp-0        correct
+  [14:02:07.383] workArea (3840,534)-(5760,1566) at rdp-3   correct
+  [14:02:07.441] workArea (0,0)-(1920,1080) at rdp-0        stale (58 ms later)
+
+The stale rectangle is the work area of the single monitor layout the
+desktop had while the 4K monitor was off. It was stored for rdp-0 and
+never corrected, so from then on every popup of that output was clamped
+into 1920x1080 by weston_desktop_surface_constrain_popup(): a menu in a
+window at x=1920 got slid to x = -menu_width (its right edge at the
+window's left edge, i.e. outside the window), and a right click near the
+bottom of the window got slid up to y = 1080 - menu_height. Taskbars sit
+at the edges, so a legitimate work area always contains the output's
+center; anything else is now ignored, which keeps the previously stored
+(or initial, full-output) work area.
+
+Reproduced and verified by pressing Win+P on the Windows side, which makes
+the client resend the layout: the correct (0,0)-(3840,2112) arrived and
+the menus were placed correctly again.
+---
+ rdprail-shell/shell.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/rdprail-shell/shell.c b/rdprail-shell/shell.c
+index 9c338320..638dedad 100644
+--- a/rdprail-shell/shell.c
++++ b/rdprail-shell/shell.c
+@@ -4787,6 +4787,37 @@ shell_backend_set_desktop_workarea(struct weston_output *output, void *context,
+ 	struct shell_output *shell_output =
+ 		find_shell_output_from_weston_output(shell, output);
+ 	if (shell_output) {
++		int64_t cx, cy;
++
++		/* The backend re-sends the work area on every display topology
++		 * change and can send one that belongs to a previous layout:
++		 * with the 4K monitor powered off and on again, the client sent
++		 * the single monitor 1920x1080 work area for rdp-0 right after
++		 * the correct 3840x2112 one (observed 2026-10-15). Every popup
++		 * of that output is then clamped into the stale rectangle by
++		 * weston_desktop_surface_constrain_popup() and ends up far away
++		 * from its parent window, e.g. pushed next to the window's left
++		 * edge or above the click point. Taskbars sit at the edges, so a
++		 * legitimate work area always contains the output's center;
++		 * reject anything else and keep the previous value. */
++		cx = (int64_t)output->x + output->width / 2;
++		cy = (int64_t)output->y + output->height / 2;
++		if (workarea->width == 0 || workarea->height == 0 ||
++		    cx < (int64_t)workarea->x ||
++		    cx >= (int64_t)workarea->x + workarea->width ||
++		    cy < (int64_t)workarea->y ||
++		    cy >= (int64_t)workarea->y + workarea->height) {
++			shell_rdp_debug(shell,
++					"%s: ignoring work area (%u,%u) %ux%u for output %s (%d,%d) %dx%d: it does not contain the output center\n",
++					__func__,
++					workarea->x, workarea->y,
++					workarea->width, workarea->height,
++					output->name ? output->name : "(unnamed)",
++					output->x, output->y,
++					output->width, output->height);
++			return;
++		}
++
+ 		struct shell_workarea_change workarea_change;
+ 		workarea_change.output = output;
+ 		workarea_change.old_workarea = shell_output->desktop_workarea; 

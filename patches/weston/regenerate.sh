@@ -13,7 +13,7 @@
 #   1. 克隆/更新 weston-mirror，fetch 各 PR 的 head
 #   2. 在 WESTON_BASE 上按固定顺序 merge 各 PR，并执行跨 PR 的冲突解决与
 #      tests/meson.build 修补（逻辑源自旧版 build-wayland-ime.yml，已实证可构建）
-#   3. 把合并结果拆成线性的 7 个补丁，写回本目录（覆盖旧 *.patch）
+#   3. 把合并结果拆成线性的 8 个补丁，写回本目录（覆盖旧 *.patch）
 #   4. 把套用后的 tree hash 写回 series.conf 的 EXPECTED_TREE
 #
 # 文本修补一律通过 load()/save() 保留文件原有行尾：weston 里 rdprail.c、
@@ -547,6 +547,61 @@ git add libweston/backend-rdp/rdpclip.c libweston/backend-rdp/rdputil.c
 git commit -q --no-edit -m "rdp-backend: register clipboard response fd on the compositor thread"
 git tag -f state-7 >/dev/null
 
+# ------------------- rdprail-shell: 丢弃过期的工作区（见 0008 补丁说明）
+log "patch: ignore stale desktop work area"
+python3 - <<PY
+import sys
+$PYHELPERS
+def patch(path, old, new):
+    s, crlf = load(path)
+    if old not in s:
+        sys.exit('ERROR: %s 中找不到目标代码（上游/PR 可能已更新）:\n%s' % (path, old))
+    save(path, s.replace(old, new, 1), crlf)
+
+patch('rdprail-shell/shell.c',
+      "\tif (shell_output) {\n"
+      "\t\tstruct shell_workarea_change workarea_change;\n"
+      "\t\tworkarea_change.output = output;\n",
+      "\tif (shell_output) {\n"
+      "\t\tint64_t cx, cy;\n"
+      "\n"
+      "\t\t/* The backend re-sends the work area on every display topology\n"
+      "\t\t * change and can send one that belongs to a previous layout:\n"
+      "\t\t * with the 4K monitor powered off and on again, the client sent\n"
+      "\t\t * the single monitor 1920x1080 work area for rdp-0 right after\n"
+      "\t\t * the correct 3840x2112 one (observed 2026-10-15). Every popup\n"
+      "\t\t * of that output is then clamped into the stale rectangle by\n"
+      "\t\t * weston_desktop_surface_constrain_popup() and ends up far away\n"
+      "\t\t * from its parent window, e.g. pushed next to the window's left\n"
+      "\t\t * edge or above the click point. Taskbars sit at the edges, so a\n"
+      "\t\t * legitimate work area always contains the output's center;\n"
+      "\t\t * reject anything else and keep the previous value. */\n"
+      "\t\tcx = (int64_t)output->x + output->width / 2;\n"
+      "\t\tcy = (int64_t)output->y + output->height / 2;\n"
+      "\t\tif (workarea->width == 0 || workarea->height == 0 ||\n"
+      "\t\t    cx < (int64_t)workarea->x ||\n"
+      "\t\t    cx >= (int64_t)workarea->x + workarea->width ||\n"
+      "\t\t    cy < (int64_t)workarea->y ||\n"
+      "\t\t    cy >= (int64_t)workarea->y + workarea->height) {\n"
+      "\t\t\tshell_rdp_debug(shell,\n"
+      "\t\t\t\t\t\"%s: ignoring work area (%u,%u) %ux%u for output %s (%d,%d) %dx%d: it does not contain the output center\\\\n\",\n"
+      "\t\t\t\t\t__func__,\n"
+      "\t\t\t\t\tworkarea->x, workarea->y,\n"
+      "\t\t\t\t\tworkarea->width, workarea->height,\n"
+      "\t\t\t\t\toutput->name ? output->name : \"(unnamed)\",\n"
+      "\t\t\t\t\toutput->x, output->y,\n"
+      "\t\t\t\t\toutput->width, output->height);\n"
+      "\t\t\treturn;\n"
+      "\t\t}\n"
+      "\n"
+      "\t\tstruct shell_workarea_change workarea_change;\n"
+      "\t\tworkarea_change.output = output;\n")
+PY
+grep -q "ignoring work area" rdprail-shell/shell.c || die "shell.c 缺少 work area 校验"
+git add rdprail-shell/shell.c
+git commit -q --no-edit -m "rdprail-shell: ignore desktop work areas that do not cover the output"
+git tag -f state-8 >/dev/null
+
 # ------------------------------------------------------------------ 校验合并结果
 log "校验合并结果"
 for m in TESTSUITE_TEXT_CONFIG_PATH exe_text_input_method_test TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH \
@@ -560,8 +615,8 @@ for a, b in (('(', ')'), ('[', ']')):
     if s.count(a) != s.count(b):
         raise SystemExit(f'ERROR: tests/meson.build 的 {a}{b} 不平衡')
 PY
-for f in $(git diff --name-only state-0 state-7); do
-  if git show "state-7:$f" | grep -qE '^(<{7} |>{7} )'; then die "$f 含冲突标记"; fi
+for f in $(git diff --name-only state-0 state-8); do
+  if git show "state-8:$f" | grep -qE '^(<{7} |>{7} )'; then die "$f 含冲突标记"; fi
 done
 
 # ---------------------------------------------- 拆成线性补丁序列并写回本目录
@@ -720,6 +775,33 @@ is reported with WL_EVENT_ERROR/HANGUP instead of write()ing into a pipe
 without readers (EPIPE + SIGPIPE, which weston does not ignore), and the
 duplicate-response check covers a response that is still queued for the
 compositor thread.
+EOF
+
+stage state-7 state-8 0008-rdprail-shell-ignore-stale-workarea <<'EOF'
+rdprail-shell: ignore desktop work areas that do not cover the output
+
+Fixes misplaced context menus and other popups after a display topology
+change. With an external 4K monitor powered off and on again, weston.log
+shows the client sending three work areas in the same moment:
+
+  [14:02:07.383] workArea (0,0)-(3840,2112) at rdp-0        correct
+  [14:02:07.383] workArea (3840,534)-(5760,1566) at rdp-3   correct
+  [14:02:07.441] workArea (0,0)-(1920,1080) at rdp-0        stale (58 ms later)
+
+The stale rectangle is the work area of the single monitor layout the
+desktop had while the 4K monitor was off. It was stored for rdp-0 and
+never corrected, so from then on every popup of that output was clamped
+into 1920x1080 by weston_desktop_surface_constrain_popup(): a menu in a
+window at x=1920 got slid to x = -menu_width (its right edge at the
+window's left edge, i.e. outside the window), and a right click near the
+bottom of the window got slid up to y = 1080 - menu_height. Taskbars sit
+at the edges, so a legitimate work area always contains the output's
+center; anything else is now ignored, which keeps the previously stored
+(or initial, full-output) work area.
+
+Reproduced and verified by pressing Win+P on the Windows side, which makes
+the client resend the layout: the correct (0,0)-(3840,2112) arrived and
+the menus were placed correctly again.
 EOF
 
 tree=$(git rev-parse 'HEAD^{tree}')
