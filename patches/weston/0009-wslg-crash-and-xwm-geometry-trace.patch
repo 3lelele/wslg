@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wslg-patches <patches@localhost>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] diagnostics: opt-in crash backtrace and XWM geometry trace
+
+weston has no handler for fatal signals and (in WSLg) is not dumpable, so
+when it dies of SIGSEGV the only evidence is a single dmesg line.  That
+made the "weston dies inside libpixman (sse2_blt) when a client window is
+decorated" crash very hard to pin down: neither a core dump nor a
+backtrace was available.
+
+Two opt-in diagnostics are added, both inert unless the corresponding
+environment variable is set (in WSLg they can be set through
+%USERPROFILE%\.wslgconfig, section [system-distro-env]):
+
+  WESTON_WSLG_CRASH_BT=1
+      Install a handler for SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGFPE that
+      appends the signal, fault address, the general purpose registers and
+      a full backtrace to WESTON_WSLG_CRASH_BT_FILE (default
+      /mnt/wslg/weston-crash.log), then re-raises the signal with the
+      default disposition so weston still dies exactly as before.
+
+  WESTON_WSLG_TRACE_XWM=1
+      In weston_wm_window_draw_decoration(), compare the size handed to
+      cairo_xcb_surface_set_size() with the frame drawable's real geometry
+      and log the mismatch.  X11 is asynchronous, so right after a window
+      is mapped or resized the drawable can still have its previous size
+      while cairo is told the new one; that is the state in which cairo's
+      xcb backend ends up walking past an internal image.
+
+When the variables are unset nothing is installed and the trace function
+only reads a cached static.
+---
+ 2 files changed, 181 insertions(+)
+
+diff --git a/compositor/main.c b/compositor/main.c
+index cc03a899..86bc4935 100644
+--- a/compositor/main.c
++++ b/compositor/main.c
+@@ -33,6 +33,10 @@
+ #include <unistd.h>
+ #include <signal.h>
+ #include <errno.h>
++#include <execinfo.h>	/* WSLg fork: backtrace() in the fatal-signal handler */
++#include <ucontext.h>	/* WSLg fork: faulting register set */
++#include <fcntl.h>
++#include <stdlib.h>
+ #include <dlfcn.h>
+ #include <stdint.h>
+ #include <string.h>
+@@ -3300,6 +3304,128 @@ sigint_helper(int sig)
+ 	raise(SIGUSR2);
+ }
+ 
++/*
++ * WSLg fork: fatal-signal diagnostics.
++ *
++ * weston installs no handler for fatal signals, so when it dies of SIGSEGV
++ * the only evidence left is a single dmesg line.  In WSLg the compositor has
++ * been seen to die inside libpixman (sse2_blt, reached from cairo) while
++ * drawing a client window, and neither a core dump nor a backtrace was
++ * available, which made the bug very hard to pin down.
++ *
++ * When the environment variable WESTON_WSLG_CRASH_BT is set to 1/true, a
++ * handler is installed that appends the faulting signal, address, the
++ * general-purpose registers and a full backtrace to WESTON_WSLG_CRASH_BT_FILE
++ * (default: /mnt/wslg/weston-crash.log), and then re-raises the signal with
++ * the default disposition so that weston still terminates exactly as before.
++ *
++ * Enable it by adding to %USERPROFILE%\.wslgconfig:
++ *
++ *     [system-distro-env]
++ *     WESTON_WSLG_CRASH_BT=1
++ *
++ * It is disabled by default and costs nothing when disabled.
++ */
++#define WSLG_CRASH_BT_FILE_DEFAULT "/mnt/wslg/weston-crash.log"
++
++static int wslg_crash_fd = -1;
++
++static void
++wslg_crash_write(const char *str)
++{
++	size_t len = strlen(str);
++
++	while (len > 0) {
++		ssize_t written = write(wslg_crash_fd, str, len);
++
++		if (written <= 0)
++			return;
++
++		str += written;
++		len -= (size_t)written;
++	}
++}
++
++static void
++wslg_crash_handler(int sig, siginfo_t *info, void *ucontext)
++{
++	void *frames[64];
++	const char *path;
++	int nframes;
++
++	if (wslg_crash_fd < 0) {
++		path = getenv("WESTON_WSLG_CRASH_BT_FILE");
++		if (!path || !path[0])
++			path = WSLG_CRASH_BT_FILE_DEFAULT;
++
++		wslg_crash_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
++	}
++
++	if (wslg_crash_fd >= 0) {
++		char buf[512];
++
++		snprintf(buf, sizeof buf,
++			 "\n===== WSLg: weston fatal signal =====\n"
++			 "signal: %d (%s)\n"
++			 "fault address: %p\n"
++			 "pid: %d\n",
++			 sig, strsignal(sig), info ? info->si_addr : NULL,
++			 (int)getpid());
++		wslg_crash_write(buf);
++
++#if defined(__x86_64__)
++		if (ucontext) {
++			const ucontext_t *uc = ucontext;
++			const greg_t *g = uc->uc_mcontext.gregs;
++
++			snprintf(buf, sizeof buf,
++				 "RIP: %016llx  RSP: %016llx  RBP: %016llx\n"
++				 "RAX: %016llx  RBX: %016llx  RCX: %016llx  RDX: %016llx\n"
++				 "RSI: %016llx  RDI: %016llx  R08: %016llx  R09: %016llx\n"
++				 "R10: %016llx  R11: %016llx  R12: %016llx  R13: %016llx\n",
++				 (unsigned long long)g[REG_RIP], (unsigned long long)g[REG_RSP],
++				 (unsigned long long)g[REG_RBP],
++				 (unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX],
++				 (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX],
++				 (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI],
++				 (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R9],
++				 (unsigned long long)g[REG_R10], (unsigned long long)g[REG_R11],
++				 (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13]);
++			wslg_crash_write(buf);
++		}
++#endif
++		wslg_crash_write("----- backtrace -----\n");
++		nframes = backtrace(frames, ARRAY_LENGTH(frames));
++		backtrace_symbols_fd(frames, nframes, wslg_crash_fd);
++		wslg_crash_write("----- end of backtrace -----\n");
++	}
++
++	/* Behave like the default disposition so that the crash is still
++	 * reported to the supervisor exactly as before. */
++	signal(sig, SIG_DFL);
++	raise(sig);
++}
++
++static void
++wslg_install_crash_handler(void)
++{
++	const char *env = getenv("WESTON_WSLG_CRASH_BT");
++	struct sigaction action;
++	int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE };
++	unsigned int i;
++
++	if (!env || (!strcmp(env, "0") || !strcmp(env, "false")))
++		return;
++
++	memset(&action, 0, sizeof action);
++	action.sa_sigaction = wslg_crash_handler;
++	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
++	sigemptyset(&action.sa_mask);
++
++	for (i = 0; i < ARRAY_LENGTH(sigs); i++)
++		sigaction(sigs[i], &action, NULL);
++}
++
+ WL_EXPORT int
+ wet_main(int argc, char *argv[])
+ {
+@@ -3397,6 +3523,9 @@ wet_main(int argc, char *argv[])
+ 
+ 	weston_log_set_handler(vlog, vlog_continue);
+ 
++	/* WSLg fork: no-op unless WESTON_WSLG_CRASH_BT is configured. */
++	wslg_install_crash_handler();
++
+ 	logger = weston_log_subscriber_create_log(weston_logfile);
+ 	flight_rec = weston_log_subscriber_create_flight_rec(DEFAULT_FLIGHT_REC_SIZE);
+ 
+diff --git a/xwayland/window-manager.c b/xwayland/window-manager.c
+index a7549df5..69397efe 100644
+--- a/xwayland/window-manager.c
++++ b/xwayland/window-manager.c
+@@ -1477,6 +1477,56 @@ weston_wm_handle_unmap_notify(struct weston_wm *wm, xcb_generic_event_t *event)
+ 	xcb_unmap_window(wm->conn, window->frame_id);
+ }
+ 
++/*
++ * WSLg fork: opt-in trace of the decoration geometry.
++ *
++ * weston tells cairo the size of the frame window on every repaint, but X11
++ * is asynchronous: the frame window may still have its previous size while
++ * the client is being resized.  If cairo then reads the drawable at a size it
++ * does not have, it can end up walking past the end of an internal image
++ * (observed as a SIGSEGV in pixman_blt via cairo's draw_image_boxes()).
++ *
++ * When WESTON_WSLG_TRACE_XWM is set to 1/true, log every case where the size
++ * handed to cairo differs from the drawable's real geometry.  Disabled by
++ * default; when disabled this function only reads a static variable.
++ *
++ * Enable it by adding to %USERPROFILE%\.wslgconfig:
++ *
++ *     [system-distro-env]
++ *     WESTON_WSLG_TRACE_XWM=1
++ */
++static void
++wslg_trace_xwm_geometry(struct weston_wm_window *window, int width, int height)
++{
++	static int enabled = -1;
++	xcb_get_geometry_cookie_t cookie;
++	xcb_get_geometry_reply_t *reply;
++
++	if (enabled < 0) {
++		const char *env = getenv("WESTON_WSLG_TRACE_XWM");
++
++		enabled = env && (!strcmp(env, "1") || !strcmp(env, "true"));
++	}
++
++	if (!enabled || window->frame_id == XCB_WINDOW_NONE)
++		return;
++
++	cookie = xcb_get_geometry(window->wm->conn, window->frame_id);
++	reply = xcb_get_geometry_reply(window->wm->conn, cookie, NULL);
++	if (!reply)
++		return;
++
++	if (reply->width != width || reply->height != height)
++		weston_log("WSLG-XWM: win %d frame %d: cairo %dx%d but X drawable %ux%u"
++			   " (client %dx%d, decorate %d, fullscreen %d)\n",
++			   window->id, window->frame_id, width, height,
++			   reply->width, reply->height,
++			   window->width, window->height,
++			   window->decorate, window->fullscreen);
++
++	free(reply);
++}
++
+ static void
+ weston_wm_window_draw_decoration(struct weston_wm_window *window)
+ {
+@@ -1486,6 +1536,8 @@ weston_wm_window_draw_decoration(struct weston_wm_window *window)
+ 
+ 	weston_wm_window_get_frame_size(window, &width, &height);
+ 
++	wslg_trace_xwm_geometry(window, width, height);
++
+ 	cairo_xcb_surface_set_size(window->cairo_surface, width, height);
+ 	cr = cairo_create(window->cairo_surface);
+ 

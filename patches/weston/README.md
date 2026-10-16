@@ -7,7 +7,7 @@ wslg 侧那样直接合进本仓库源码。这里用的是等价做法：**固�
 | 文件 | 作用 |
 |---|---|
 | `series.conf` | 基线提交 `WESTON_BASE`、套用后的期望 tree hash `EXPECTED_TREE` |
-| `0001`–`0006-*.patch` | 补丁序列，按文件名顺序套用 |
+| `0001`–`0009-*.patch` | 补丁序列，按文件名顺序套用 |
 | `apply.sh` | **构建用**。克隆/检出基线并套用补丁，幂等，结果用 tree hash 校验 |
 | `regenerate.sh` | **维护用**。从上游 PR 重新生成补丁序列（需要网络） |
 
@@ -23,6 +23,7 @@ wslg 侧那样直接合进本仓库源码。这里用的是等价做法：**固�
 | 0006 | 本仓库 | #169+#172 组合问题：xdg_popup 的 RAIL owner 设为父窗口（候选框弹出时搜索框被主窗口盖住） |
 | 0007 | 本仓库 | rdp-backend 剪贴板：Windows 侧数据响应改在 compositor 线程注册 fd。修复复制后 weston 在 `wl_event_source_remove(NULL)` 段错误、整个 WSLg 会话消失的问题（#166 之后仍会出现，是跨线程竞态） |
 | 0008 | 本仓库 | rdprail-shell：丢弃"没有覆盖输出中心点"的桌面工作区。修复外接显示器断电再上电后，客户端补发的过期工作区（如 4K 屏被写成 1920x1080）把菜单等弹窗挤到窗口之外的问题 |
+| 0009 | 本仓库 | 纯诊断（默认关闭，见 FORK.md §4.3）：由 `WESTON_WSLG_CRASH_BT` 开启的致命信号 backtrace（weston 崩在 libpixman 时没有 core 也没有栈）；由 `WESTON_WSLG_TRACE_XWM` 开启的装饰几何日志（cairo 认定的尺寸 vs X drawable 实际尺寸） |
 
 0002–0004 还各自带了让它们能一起编译的集成修复（`tests/meson.build` 条目并置、
 `extract_objects` 补文件、#169/#172 的冲突解决），具体见各补丁的描述。

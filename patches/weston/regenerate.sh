@@ -602,6 +602,19 @@ git add rdprail-shell/shell.c
 git commit -q --no-edit -m "rdprail-shell: ignore desktop work areas that do not cover the output"
 git tag -f state-8 >/dev/null
 
+# ------------------------------------------------------------------ 0009：诊断
+# 0009 是纯诊断代码（崩溃 backtrace + XWM 几何日志），全部由环境变量开关控制，
+# 未配置时完全不执行。它在 0008 之上改动较大（新增 ~180 行），直接以补丁形式
+# 应用，避免把大段文本再抄一遍；若将来基线升级导致无法套用，git apply 会失败并
+# 由 set -e 中止，届时按提示调整即可。
+log "应用 0009（诊断：崩溃 backtrace + XWM 几何日志）"
+git apply --index "$here/0009-wslg-crash-and-xwm-geometry-trace.patch" \
+  || die "0009 无法套用（基线可能已变化）"
+grep -q "WSLG-XWM" xwayland/window-manager.c || die "0009 未生效（window-manager.c）"
+grep -q "WSLG_CRASH_BT" compositor/main.c || die "0009 未生效（main.c）"
+git commit -q --no-edit -m "diagnostics: opt-in crash backtrace and XWM geometry trace"
+git tag -f state-9 >/dev/null
+
 # ------------------------------------------------------------------ 校验合并结果
 log "校验合并结果"
 for m in TESTSUITE_TEXT_CONFIG_PATH exe_text_input_method_test TESTSUITE_INPUT_METHOD_ALLOW_CONFIG_PATH \
@@ -615,8 +628,8 @@ for a, b in (('(', ')'), ('[', ']')):
     if s.count(a) != s.count(b):
         raise SystemExit(f'ERROR: tests/meson.build 的 {a}{b} 不平衡')
 PY
-for f in $(git diff --name-only state-0 state-8); do
-  if git show "state-8:$f" | grep -qE '^(<{7} |>{7} )'; then die "$f 含冲突标记"; fi
+for f in $(git diff --name-only state-0 state-9); do
+  if git show "state-9:$f" | grep -qE '^(<{7} |>{7} )'; then die "$f 含冲突标记"; fi
 done
 
 # ---------------------------------------------- 拆成线性补丁序列并写回本目录
@@ -806,6 +819,29 @@ EOF
 
 tree=$(git rev-parse 'HEAD^{tree}')
 sed -i "s/^EXPECTED_TREE=.*/EXPECTED_TREE=$tree/" "$here/series.conf"
+
+stage state-8 state-9 0009-wslg-crash-and-xwm-geometry-trace <<'EOF'
+diagnostics: opt-in crash backtrace and XWM geometry trace
+
+weston has no handler for fatal signals and (in WSLg) is not dumpable, so
+when it dies of SIGSEGV the only evidence is a single dmesg line, which
+made the "weston dies inside libpixman (sse2_blt) while drawing a client
+window decoration" crash very hard to pin down.
+
+Adds two opt-in diagnostics, both inert unless the matching environment
+variable is set (in WSLg: %USERPROFILE%\.wslgconfig, section
+[system-distro-env]):
+
+  WESTON_WSLG_CRASH_BT=1
+      handler for SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGFPE that appends the
+      signal, fault address, general purpose registers and a backtrace to
+      WESTON_WSLG_CRASH_BT_FILE (default /mnt/wslg/weston-crash.log), then
+      re-raises the signal with the default disposition.
+
+  WESTON_WSLG_TRACE_XWM=1
+      log every case where the size handed to cairo_xcb_surface_set_size()
+      differs from the frame drawable's real geometry.
+EOF
 
 echo
 log "完成。补丁已写入 $here，EXPECTED_TREE=$tree"

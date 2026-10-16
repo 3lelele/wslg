@@ -40,6 +40,7 @@ weston 不在本仓库里（`vendor/` 被 gitignore，构建时克隆），所�
 | 0006 | 本 fork 原创 | #169+#172 组合问题：xdg_popup 的 RAIL owner 设为父窗口（候选框出现时 popup 被主窗口盖住） |
 | 0007 | 本 fork 原创 | rdp-backend 剪贴板：Windows 侧数据响应改在 compositor 线程注册 fd。修复"复制后 weston 段错误、整个 WSLg 会话消失"（#166 之后仍会出现的跨线程竞态，见 §4.1） |
 | 0008 | 本 fork 原创 | rdprail-shell：丢弃未覆盖输出中心点的桌面工作区。修复外接显示器断电再上电后，客户端补发的过期工作区（4K 屏被写成 1920x1080）把右键菜单等弹窗挤到窗口之外（见 §4.2） |
+| 0009 | 本 fork 原创 | 纯诊断补丁（默认全部关闭）：① `WESTON_WSLG_CRASH_BT=1` 时安装致命信号处理器，把信号、故障地址、寄存器和完整 backtrace 追加到 `/mnt/wslg/weston-crash.log`；② `WESTON_WSLG_TRACE_XWM=1` 时记录"交给 cairo 的尺寸"与"X drawable 实际几何"不一致的情况（见 §4.3） |
 
 0002–0004 各自还带着让它们能一起编译的集成修复（`tests/meson.build` 条目并置、
 `extract_objects` 补文件、#169/#172 在 `backend-rdp.h`/`rdprail.c` 的冲突解决）。
@@ -151,6 +152,64 @@ WSLg 里 Windows 会在 Linux 复制后约 1 秒把同样内容再推回来两�
 必然包含输出中心点，不包含的一律忽略并打日志，保留旧值（初始值为输出的完整矩形）。
 `regenerate.sh` 增加 state-8 步骤，`EXPECTED_TREE` 更新为 `49277748904c…`。
 上游同样有此问题（客户端发过期 sysparam，weston 照单全收），值得一并反馈。
+
+### 4.3 2026-10-16：weston 崩在 libpixman（cairo 调用 `pixman_blt` 越界读）
+
+现象：点击开始菜单里的应用（复现条件：fcitx5 已启动 + IDEA 已打开 + **第一次**启动
+Alacritty）后，整个 GUI 消失、IDEA 界面没了但进程还在；随后 fcitx5 也死掉（它的日志是
+`Connection removed` → XCB 连接错误 → 逐个 unload addon），于是输入法失效。dmesg：
+
+```
+weston[184]: segfault at ... ip ... error 4 in libpixman-1.so.0.43.2[93fd0, ...+8a000]
+Code: ... <f3> 0f 6f 50 10 f3 0f 6f 18 ...
+```
+
+已经确认的部分：
+
+* 崩溃指令是 `movdqu 0x10(%rax),%xmm2`，位于 **`sse2_blt`（pixman 的 SSE2 版
+  `pixman_blt`）**，`error 4` = **从源缓冲区读越界**（`%rax` 是源行指针，`%rbx`/`%r9`
+  是行字节数与 stride，`%rdi+1` 是行数）。
+* 扫过 system distro 里全部二进制：**weston 进程内只有 libcairo 引用 `pixman_blt`**
+  （libweston、rdp-backend、xwayland 模块、librsvg、pango、FreeRDP/winpr 都没有；
+  Xwayland 自己有，但那是独立进程）。pixman 内部也只有公开 API `pixman_blt()` 能进到
+  这个函数 ⇒ 调用链是 **weston → cairo `draw_image_boxes()` → `pixman_blt()`**。
+* 上游是同一个 bug，至今未修：microsoft/wslg **#1386**（winit 应用，机器码字节完全一致）、
+  **#1139**、**#1358**。
+* 两次崩溃的寄存器反推出几何：源与目标 stride 都等于宽度（都是**窗口尺寸的图像**），
+  条带分别是 **888×44** 与 **44×635**——正好等于 `render_shadow()` 里"顶部/底部拉伸"和
+  "左/右拉伸"的矩形形状。weston 的 XWM 每次重绘都调用
+  `cairo_xcb_surface_set_size(新尺寸)`，而 X11 的窗口 resize 是异步的：新窗口刚 map
+  或刚被 resize 时 drawable 还是旧尺寸，cairo 按新尺寸去读旧内容 ⇒ 越界。
+
+为什么难定位（都已排除/规避）：
+
+* **没有 core**：weston 在 WSLg 里是 non-dumpable（WSL 自带崩溃捕获会这样设），
+  `core_pattern`、`RLIMIT_CORE` 都设好了也不写；用 gdb `call (int)prctl(4,1)` 可以在
+  运行中改回来。
+* **system distro 的 overlay 是临时的**：`wsl --system` 每次会话结束，装进去的包、
+  改过的文件都会消失（只有内核状态和 `/mnt/wsl/share_vhdx` 持久）。所以任何文件级
+  插桩必须在**同一个常驻（setsid）会话**里完成。
+* **wrapper 会破坏 WSLGd 的重启**：用脚本包 `/usr/bin/weston` 会多一层 `sh`、pid 变化，
+  WSLGd 跟丢进程后不再拉起 weston（会话起不来）。要用保持 pid 的**二进制** wrapper。
+* gdb 附着容易扑空：weston 的本地 pid 会被**复用**，必须按 `/proc/<pid>/stat` 的
+  starttime 识别实例。
+
+因此补丁 0009 提供两个**默认关闭**的开关（在 `%USERPROFILE%\.wslgconfig` 的
+`[system-distro-env]` 段里配置，WSLGd 会把它变成 system distro 的环境变量）：
+
+```ini
+[system-distro-env]
+WESTON_WSLG_CRASH_BT=1
+WESTON_WSLG_TRACE_XWM=1
+```
+
+* `WESTON_WSLG_CRASH_BT`：安装 SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGFPE 处理器，把信号、
+  故障地址、通用寄存器、完整 backtrace 追加到 `WESTON_WSLG_CRASH_BT_FILE`
+  （默认 `/mnt/wslg/weston-crash.log`），然后用默认处置重新 raise，行为与原来一致。
+* `WESTON_WSLG_TRACE_XWM`：在 `weston_wm_window_draw_decoration()` 里比较交给 cairo 的
+  尺寸与 frame drawable 的真实几何，不一致时打一行 `WSLG-XWM: ...` 日志。
+
+两个开关都不配置时，新增代码不注册任何处理器、也不做任何查询（只读一个静态变量）。
 
 ## 5. 维护指南
 

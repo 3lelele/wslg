@@ -13,6 +13,8 @@
 #       + 四个本仓库自己的修复（popup 无 buffer 判定、xdg_popup RAIL owner、
 #         剪贴板响应改在 compositor 线程注册 fd —— 复制后 weston 段错误、
 #         丢弃过期的桌面工作区 —— 显示器断电重连后菜单弹到窗口外）
+#       + 一个纯诊断补丁（默认关闭，由 .wslgconfig 的 [system-distro-env] 段里
+#         WESTON_WSLG_CRASH_BT / WESTON_WSLG_TRACE_XWM 控制，见 FORK.md §4.3）
 #     基线提交、补丁来源与升级方法见 patches/weston/README.md 与 series.conf。
 #
 # 产物: system_x64.vhd（配合 .wslconfig 的 systemDistro= 使用，随时可回滚官方版）
